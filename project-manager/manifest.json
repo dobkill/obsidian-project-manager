@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-project-management",
+  "name": "Obsidian Project Management",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Manage projects, weekly plans, today's tasks, and completion heatmaps in Obsidian.",
+  "author": "OpenAI Codex",
+  "authorUrl": "https://openai.com",
+  "isDesktopOnly": false
+}

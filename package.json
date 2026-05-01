@@ -1,0 +1,17 @@
+{
+  "name": "obsidian-project-management",
+  "version": "0.1.0",
+  "description": "Project and task management plugin for Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "dev": "node esbuild.config.mjs --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "esbuild": "^0.25.4",
+    "obsidian": "^1.8.10",
+    "tslib": "^2.8.1",
+    "typescript": "^5.8.3"
+  }
+}
