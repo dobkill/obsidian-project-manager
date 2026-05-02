@@ -17,7 +17,7 @@ export class ProjectManagementSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("数据目录路径")
-      .setDesc("必须是当前 Vault 内相对路径。目录不存在会自动创建，目录内存在非插件文件会拒绝使用。")
+      .setDesc("必须是当前 Vault 内相对路径。目标目录已有有效插件数据时会直接加载；目录不存在、为空或插件数据损坏时会用当前数据创建新文件。")
       .addText((text) =>
         text.setValue(this.plugin.settings.dataFolder).onChange(async (value) => {
           this.plugin.pendingSettings.dataFolder = value.trim();

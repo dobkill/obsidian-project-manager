@@ -91,9 +91,6 @@ function getWeekDates(anchor) {
 function getChineseWeekday(date) {
   return WEEKDAY_LABELS[date.getDay()];
 }
-function formatWeekColumnTitle(date) {
-  return `${getChineseWeekday(date)} ${toDateKey(date)}`;
-}
 function formatShortMonth(date) {
   return `${date.getMonth() + 1}\u6708`;
 }
@@ -144,6 +141,7 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     this.progressPages = [];
     this.tasks = /* @__PURE__ */ new Map();
     this.writeQueue = Promise.resolve();
+    this.readOnlyReason = null;
     this.app = app;
     this.config = config;
   }
@@ -160,9 +158,45 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     return structuredClone(this.config);
   }
   async setConfig(next) {
-    this.config = structuredClone(next);
-    await this.ensureDataFolder();
-    await this.enqueueWrite(() => this.writeJson(this.pathFor(CONFIG_FILE), this.config));
+    this.assertWritable();
+    const previousFolder = sanitizeFolder(this.config.dataFolder);
+    const nextFolder = sanitizeFolder(next.dataFolder);
+    const nextConfig = { ...next, dataFolder: nextFolder };
+    if (previousFolder !== nextFolder) {
+      await this.flushPendingWrites();
+      const currentData = this.captureDataState();
+      const usage = await this.inspectDataFolder(nextFolder);
+      this.config = structuredClone(nextConfig);
+      await this.ensureDataFolder();
+      if (usage.hasData && usage.invalidPaths.length === 0) {
+        const failedPaths = await this.loadCurrentFolderData();
+        if (failedPaths.length === 0) {
+          await this.flushAll();
+          await this.reloadCurrentFolderData();
+          new import_obsidian.Notice(`\u6570\u636E\u76EE\u5F55\u5DF2\u5207\u6362\u5230 ${nextFolder}\uFF0C\u5DF2\u4F7F\u7528\u76EE\u6807\u76EE\u5F55\u4E2D\u7684\u73B0\u6709\u6570\u636E`);
+        } else {
+          this.restoreDataState(currentData);
+          this.config = structuredClone(nextConfig);
+          await this.flushAll();
+          await this.reloadCurrentFolderData();
+          new import_obsidian.Notice(`\u76EE\u6807\u76EE\u5F55\u6570\u636E\u683C\u5F0F\u5F02\u5E38\uFF0C\u5DF2\u7528\u5F53\u524D\u6570\u636E\u91CD\u65B0\u521B\u5EFA\uFF1A${failedPaths.join("\u3001")}`, 0);
+        }
+      } else {
+        this.restoreDataState(currentData);
+        await this.flushAll();
+        await this.reloadCurrentFolderData();
+        if (usage.invalidPaths.length > 0) {
+          new import_obsidian.Notice(`\u76EE\u6807\u76EE\u5F55\u6570\u636E\u683C\u5F0F\u5F02\u5E38\uFF0C\u5DF2\u7528\u5F53\u524D\u6570\u636E\u91CD\u65B0\u521B\u5EFA\uFF1A${usage.invalidPaths.join("\u3001")}`, 0);
+        } else {
+          new import_obsidian.Notice(`\u6570\u636E\u76EE\u5F55\u5DF2\u5207\u6362\u5230 ${nextFolder}\uFF0C\u5DF2\u521B\u5EFA\u65B0\u7684\u6570\u636E\u6587\u4EF6`);
+        }
+      }
+    } else {
+      this.config = structuredClone(nextConfig);
+      await this.ensureDataFolder();
+      await this.enqueueWrite(() => this.writeJson(this.pathFor(CONFIG_FILE), this.config));
+      await this.reloadCurrentFolderData();
+    }
     this.trigger("changed");
   }
   getProjects() {
@@ -220,51 +254,89 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     };
   }
   async initialize() {
-    this.config = await this.loadConfigFile();
+    const configResult = await this.loadConfigFile();
+    this.config = configResult.config;
     await this.ensureDataFolder();
-    await this.loadProjects();
-    await this.loadProgressPages();
-    await this.loadTasks();
+    const failedPaths = [...configResult.failedPaths, ...await this.loadCurrentFolderData()].filter((path, index, list) => list.indexOf(path) === index);
+    if (failedPaths.length > 0) {
+      this.readOnlyReason = `\u68C0\u6D4B\u5230\u6570\u636E\u6587\u4EF6\u8BFB\u53D6\u5931\u8D25\uFF0C\u5DF2\u8FDB\u5165\u53EA\u8BFB\u4FDD\u62A4\uFF1A${failedPaths.join("\u3001")}`;
+      new import_obsidian.Notice(this.readOnlyReason, 0);
+      console.error(this.readOnlyReason);
+      return;
+    }
+    this.readOnlyReason = null;
     await this.flushAll();
   }
+  async refreshFromDisk(options = {}) {
+    const { triggerChange = true } = options;
+    const failedPaths = await this.loadCurrentFolderData();
+    if (failedPaths.length > 0) {
+      this.readOnlyReason = `\u68C0\u6D4B\u5230\u6570\u636E\u6587\u4EF6\u8BFB\u53D6\u5931\u8D25\uFF0C\u5DF2\u8FDB\u5165\u53EA\u8BFB\u4FDD\u62A4\uFF1A${failedPaths.join("\u3001")}`;
+      throw new Error(this.readOnlyReason);
+    }
+    this.readOnlyReason = null;
+    if (triggerChange) {
+      this.trigger("changed");
+    }
+  }
+  async flushPendingWrites() {
+    await this.writeQueue;
+    if (!this.readOnlyReason) {
+      await this.flushAll();
+    }
+  }
   async validateDataFolder(path) {
+    const raw = path.trim();
     const cleaned = sanitizeFolder(path);
     if (!cleaned) {
       return { ok: false, message: "\u6570\u636E\u76EE\u5F55\u4E0D\u80FD\u4E3A\u7A7A" };
     }
-    if (cleaned.startsWith("/") || cleaned.includes("..")) {
+    if (raw.startsWith("/") || cleaned.includes("..")) {
       return { ok: false, message: "\u6570\u636E\u76EE\u5F55\u5FC5\u987B\u662F Vault \u5185\u76F8\u5BF9\u8DEF\u5F84" };
     }
     const normalized = (0, import_obsidian.normalizePath)(cleaned);
     const abstract = this.app.vault.getAbstractFileByPath(normalized);
-    if (!abstract) {
+    const stat = abstract ? null : await this.app.vault.adapter.stat(normalized);
+    if (!abstract && !stat) {
       return { ok: true };
     }
-    if (!(abstract instanceof import_obsidian.TFolder)) {
+    if (abstract && !(abstract instanceof import_obsidian.TFolder)) {
       return { ok: false, message: "\u6570\u636E\u76EE\u5F55\u8DEF\u5F84\u5DF2\u88AB\u6587\u4EF6\u5360\u7528" };
     }
+    if (!abstract && stat?.type !== "folder") {
+      return { ok: false, message: "\u6570\u636E\u76EE\u5F55\u8DEF\u5F84\u5DF2\u88AB\u6587\u4EF6\u5360\u7528" };
+    }
+    const children = abstract instanceof import_obsidian.TFolder ? abstract.children.map((child) => ({ name: child.name, isFolder: child instanceof import_obsidian.TFolder })) : await this.listFolderEntries(normalized);
     const allowed = /* @__PURE__ */ new Set([CONFIG_FILE, PROJECTS_FILE, PROGRESS_FILE, TASKS_DIR]);
-    const invalid = abstract.children.some((child) => !allowed.has(child.name));
+    const invalid = children.some((child) => !allowed.has(child.name));
     if (invalid) {
       return { ok: false, message: "\u76EE\u5F55\u4E2D\u5B58\u5728\u975E\u63D2\u4EF6\u6587\u4EF6\uFF0C\u62D2\u7EDD\u4F7F\u7528" };
+    }
+    const invalidTasksPath = children.some((child) => child.name === TASKS_DIR && !child.isFolder);
+    if (invalidTasksPath) {
+      return { ok: false, message: "tasks \u8DEF\u5F84\u5DF2\u88AB\u6587\u4EF6\u5360\u7528" };
     }
     return { ok: true };
   }
   async createTask(input) {
+    this.assertWritable();
     const normalized = this.normalizeTaskInput(input);
     const created = this.buildSeriesTask(normalized);
     this.assertNoConflicts([created], /* @__PURE__ */ new Set());
     this.insertTask(created);
     await this.persistMonths(monthsForTasks([created]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
-    return cloneTask(created);
+    return cloneTask(this.findTask(created.id) ?? created);
   }
   async updateTask(taskId, patch, _scope = "series") {
+    this.assertWritable();
     const original = this.findTask(taskId);
     if (!original) {
       throw new Error("\u4EFB\u52A1\u4E0D\u5B58\u5728");
     }
     const merged = this.normalizeTaskInput({
+      kind: patch.kind ?? original.kind,
       title: patch.title ?? original.title,
       description: patch.description ?? original.description,
       projectId: patch.projectId === void 0 ? original.projectId : patch.projectId,
@@ -274,16 +346,19 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       recurrence: patch.recurrence ?? original.recurrence,
       recurrenceCount: patch.recurrenceCount ?? original.recurrenceCount ?? void 0,
       recurrenceUntil: patch.recurrenceUntil ?? original.recurrenceUntil ?? void 0,
+      subtasks: patch.subtasks ?? original.subtasks,
       completed: patch.completed ?? isTaskFullyCompleted(original)
     });
     const next = this.buildSeriesTask(merged, original, patch.completed);
     this.assertNoConflicts([next], occurrenceKeysForTask(original));
     this.replaceTasks([original.id], [next]);
     await this.persistMonths(monthsForTasks([original, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
-    return cloneTask(next);
+    return cloneTask(this.findTask(next.id) ?? next);
   }
   async updateTaskOccurrenceCompletion(taskId, date, completed) {
+    this.assertWritable();
     const original = this.findTask(taskId);
     if (!original) {
       throw new Error("\u4EFB\u52A1\u4E0D\u5B58\u5728");
@@ -292,13 +367,52 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       throw new Error("\u4EFB\u52A1\u53D1\u751F\u65E5\u671F\u4E0D\u5B58\u5728");
     }
     const next = cloneTask(original);
-    next.completedOccurrences = completed ? upsertCompletionRecord(original.completedOccurrences, date, toIsoLocal(now())) : original.completedOccurrences.filter((item) => item.date !== date);
+    next.occurrenceStates = completed ? upsertOccurrenceState(original, date, {
+      completedSubtaskIds: getAllSubtaskIds(original),
+      completedAt: toIsoLocal(now())
+    }) : next.occurrenceStates.filter((item) => item.date !== date);
     next.updatedAt = toIsoLocal(now());
     this.replaceTasks([original.id], [next]);
     await this.persistMonths(monthsForTasks([original, next]));
+    await this.reloadCurrentFolderData();
+    this.trigger("changed");
+  }
+  async updateTaskOccurrenceSubtaskCompletion(taskId, date, subtaskId, completed) {
+    this.assertWritable();
+    const original = this.findTask(taskId);
+    if (!original) {
+      throw new Error("\u4EFB\u52A1\u4E0D\u5B58\u5728");
+    }
+    if (original.kind !== "composite") {
+      throw new Error("\u5F53\u524D\u4EFB\u52A1\u4E0D\u662F\u7EC4\u5408\u4EFB\u52A1");
+    }
+    if (!original.occurrenceDates.includes(date)) {
+      throw new Error("\u4EFB\u52A1\u53D1\u751F\u65E5\u671F\u4E0D\u5B58\u5728");
+    }
+    if (!original.subtasks.some((item) => item.id === subtaskId)) {
+      throw new Error("\u5B50\u4EFB\u52A1\u4E0D\u5B58\u5728");
+    }
+    const state = getOccurrenceState(original, date);
+    const completedSubtaskIds = new Set(state?.completedSubtaskIds ?? []);
+    if (completed) {
+      completedSubtaskIds.add(subtaskId);
+    } else {
+      completedSubtaskIds.delete(subtaskId);
+    }
+    const next = cloneTask(original);
+    const nextCompletedIds = original.subtasks.map((item) => item.id).filter((id) => completedSubtaskIds.has(id));
+    next.occurrenceStates = nextCompletedIds.length === 0 ? next.occurrenceStates.filter((item) => item.date !== date) : upsertOccurrenceState(original, date, {
+      completedSubtaskIds: nextCompletedIds,
+      completedAt: nextCompletedIds.length === original.subtasks.length ? toIsoLocal(now()) : null
+    });
+    next.updatedAt = toIsoLocal(now());
+    this.replaceTasks([original.id], [next]);
+    await this.persistMonths(monthsForTasks([original, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
   async deleteTask(taskId, scope = "series") {
+    this.assertWritable();
     const task = this.findTask(taskId);
     if (!task) {
       return;
@@ -309,9 +423,11 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     }
     const removed = this.replaceTasks([taskId], []);
     await this.persistMonths(monthsForTasks(removed));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
   async deleteTaskOccurrence(taskId, date) {
+    this.assertWritable();
     const task = this.findTask(taskId);
     if (!task) {
       return;
@@ -322,12 +438,13 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     if (task.occurrenceDates.length === 1) {
       const removed = this.replaceTasks([task.id], []);
       await this.persistMonths(monthsForTasks(removed));
+      await this.reloadCurrentFolderData();
       this.trigger("changed");
       return;
     }
     const next = cloneTask(task);
     next.occurrenceDates = task.occurrenceDates.filter((entry) => entry !== date);
-    next.completedOccurrences = task.completedOccurrences.filter((entry) => entry.date !== date);
+    next.occurrenceStates = task.occurrenceStates.filter((entry) => entry.date !== date);
     next.date = next.occurrenceDates[0];
     next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
     next.recurrenceCount = next.recurrence === "once" ? null : next.occurrenceDates.length;
@@ -336,9 +453,11 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     this.assertNoConflicts([next], occurrenceKeysForTask(task));
     this.replaceTasks([task.id], [next]);
     await this.persistMonths(monthsForTasks([task, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
   async completeTaskSeries(taskId, throughDate) {
+    this.assertWritable();
     const task = this.findTask(taskId);
     if (!task) {
       return;
@@ -348,9 +467,11 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     const remainingDates = task.occurrenceDates.filter((date) => compareDateKeys(date, effectiveDate) <= 0);
     const stamp = toIsoLocal(now());
     next.occurrenceDates = remainingDates;
-    next.completedOccurrences = remainingDates.reduce((records, date) => {
-      const existing = task.completedOccurrences.find((item) => item.date === date);
-      records.push(existing ?? { date, completedAt: stamp });
+    next.occurrenceStates = remainingDates.reduce((records, date) => {
+      const existing = getOccurrenceState(task, date);
+      records.push(
+        existing ? buildNormalizedOccurrenceState(date, task.kind, task.subtasks, existing.completedSubtaskIds ?? getAllSubtaskIds(task), stamp) : buildNormalizedOccurrenceState(date, task.kind, task.subtasks, getAllSubtaskIds(task), stamp)
+      );
       return records;
     }, []);
     next.date = next.occurrenceDates[0];
@@ -360,9 +481,11 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     next.updatedAt = stamp;
     this.replaceTasks([task.id], [next]);
     await this.persistMonths(monthsForTasks([task, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
   async createProject(input) {
+    this.assertWritable();
     const timestamp = toIsoLocal(now());
     const project = {
       id: crypto.randomUUID(),
@@ -387,10 +510,12 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       await this.writeJson(this.pathFor(PROJECTS_FILE), { projects: this.projects });
       await this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages });
     });
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
     return { ...project };
   }
   async updateProject(projectId, patch) {
+    this.assertWritable();
     const project = this.projects.find((entry) => entry.id === projectId);
     if (!project) {
       throw new Error("\u9879\u76EE\u4E0D\u5B58\u5728");
@@ -409,26 +534,30 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       await this.writeJson(this.pathFor(PROJECTS_FILE), { projects: this.projects });
       await this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages });
     });
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
   async deleteProject(projectId) {
+    this.assertWritable();
     this.projects = this.projects.filter((project) => project.id !== projectId);
     this.progressPages = this.progressPages.filter((page) => page.projectId !== projectId);
-    const timestamp = toIsoLocal(now());
-    const tasks = this.getTasksForProject(projectId).map((task) => ({
-      ...task,
-      projectId: void 0,
-      updatedAt: timestamp
-    }));
-    this.replaceTasks(tasks.map((task) => task.id), tasks);
+    const removedTasks = this.replaceTasks(
+      this.getTasksForProject(projectId).map((task) => task.id),
+      []
+    );
+    const affectedMonths = [...new Set(monthsForTasks(removedTasks))];
     await this.enqueueWrite(async () => {
       await this.writeJson(this.pathFor(PROJECTS_FILE), { projects: this.projects });
       await this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages });
-      await this.flushAllTasks();
+      for (const month of affectedMonths) {
+        await this.flushMonth(month);
+      }
     });
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
   async reorderProgressPage(projectId, direction) {
+    this.assertWritable();
     const index = this.progressPages.findIndex((page) => page.projectId === projectId);
     const target = index + direction;
     if (index < 0 || target < 0 || target >= this.progressPages.length) {
@@ -437,15 +566,15 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     const [item] = this.progressPages.splice(index, 1);
     this.progressPages.splice(target, 0, item);
     await this.enqueueWrite(() => this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages }));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
   getProjectProgress(projectId) {
-    const tasks = this.getOccurrencesForProject(projectId);
-    if (tasks.length === 0) {
+    const progress = summarizeOccurrencesProgress(this.getOccurrencesForProject(projectId));
+    if (progress.totalSteps === 0) {
       return 0;
     }
-    const done = tasks.filter((task) => task.completed).length;
-    return Math.round(done / tasks.length * 100);
+    return Math.round(progress.completedSteps / progress.totalSteps * 100);
   }
   normalizeTaskInput(input) {
     const title = input.title.trim();
@@ -473,8 +602,10 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       }
     }
     const recurrence = input.recurrence ?? "once";
+    const kind = input.kind ?? "simple";
     const recurrenceCount = recurrence === "once" ? null : normalizePositiveInteger(input.recurrenceCount);
     const recurrenceUntil = recurrence === "once" ? null : normalizeDateOrUndefined(input.recurrenceUntil);
+    const subtasks = normalizeSubtaskInputs(input.subtasks, kind);
     if (recurrence !== "once" && !recurrenceCount && !recurrenceUntil) {
       throw new Error("\u91CD\u590D\u4EFB\u52A1\u5FC5\u987B\u586B\u5199\u91CD\u590D\u6B21\u6570\u6216\u7ED3\u675F\u65E5\u671F");
     }
@@ -482,6 +613,7 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       throw new Error("\u91CD\u590D\u7ED3\u675F\u65E5\u671F\u4E0D\u80FD\u65E9\u4E8E\u9996\u4E2A\u4EFB\u52A1\u65E5\u671F");
     }
     return {
+      kind,
       title,
       description: input.description?.trim() || "",
       projectId: input.projectId || void 0,
@@ -491,21 +623,25 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       recurrence,
       recurrenceCount,
       recurrenceUntil,
+      subtasks,
       completed: input.completed ?? false
     };
   }
   buildSeriesTask(input, original, completedPatch) {
     const timestamp = toIsoLocal(now());
     const occurrenceDates = buildOccurrenceDates(input);
-    const completedOccurrences = resolveCompletedOccurrences({
+    const subtasks = resolveTaskSubtasks(input.subtasks, input.kind ?? "simple", original?.subtasks ?? []);
+    const occurrenceStates = resolveOccurrenceStates({
       input,
       original,
+      subtasks,
       occurrenceDates,
       timestamp,
       completedPatch
     });
     return {
       id: original?.id ?? crypto.randomUUID(),
+      kind: input.kind ?? "simple",
       title: input.title,
       description: input.description,
       projectId: input.projectId,
@@ -515,8 +651,9 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       recurrence: input.recurrence,
       recurrenceCount: input.recurrenceCount ?? null,
       recurrenceUntil: input.recurrenceUntil ?? null,
+      subtasks,
       occurrenceDates,
-      completedOccurrences,
+      occurrenceStates,
       createdAt: original?.createdAt ?? timestamp,
       updatedAt: timestamp
     };
@@ -592,33 +729,60 @@ var ProjectManagementStore = class extends import_obsidian.Events {
   }
   async loadConfigFile() {
     const path = this.pathFor(CONFIG_FILE);
-    const existing = await this.readJson(path);
-    return { ...DEFAULT_CONFIG, ...existing };
+    const dataFolder = sanitizeFolder(this.config.dataFolder);
+    const existing = await this.readJson(path, isPartialPluginConfig);
+    return {
+      config: { ...DEFAULT_CONFIG, ...this.config, ...existing.value ?? {}, dataFolder },
+      failedPaths: existing.ok ? [] : [existing.path]
+    };
   }
   async loadProjects() {
-    const data = await this.readJson(this.pathFor(PROJECTS_FILE));
-    this.projects = data?.projects ?? [];
+    const data = await this.readJson(this.pathFor(PROJECTS_FILE), isProjectsFile);
+    this.projects = data.value?.projects ?? [];
+    return { failedPaths: data.ok ? [] : [data.path] };
   }
   async loadProgressPages() {
-    const data = await this.readJson(this.pathFor(PROGRESS_FILE));
-    this.progressPages = data?.pages ?? [];
+    const data = await this.readJson(this.pathFor(PROGRESS_FILE), isProgressPagesFile);
+    this.progressPages = data.value?.pages ?? [];
+    return { failedPaths: data.ok ? [] : [data.path] };
   }
   async loadTasks() {
     const tasksFolder = this.pathFor(TASKS_DIR);
     const folder = this.app.vault.getAbstractFileByPath(tasksFolder);
-    if (!(folder instanceof import_obsidian.TFolder)) {
+    const folderStat = folder ? null : await this.app.vault.adapter.stat(tasksFolder);
+    if (folder && !(folder instanceof import_obsidian.TFolder) || !folder && folderStat && folderStat.type !== "folder") {
+      return { failedPaths: [tasksFolder] };
+    }
+    if (!folder && !folderStat) {
       this.tasks.clear();
-      return;
+      return { failedPaths: [] };
     }
     this.tasks.clear();
-    for (const child of folder.children) {
-      if (child instanceof import_obsidian.TFolder || !child.name.endsWith(".json")) {
-        continue;
+    const failedPaths = [];
+    const monthFiles = await this.collectMonthFilePaths(tasksFolder);
+    for (const childPath of monthFiles) {
+      const data = await this.readJson(childPath, isTasksFile);
+      const month = childPath.split("/").pop()?.replace(/\.json$/, "") ?? "";
+      if (!data.ok) {
+        failedPaths.push(childPath);
       }
-      const data = await this.readJson(child.path);
-      const month = child.name.replace(/\.json$/, "");
-      this.tasks.set(month, (data?.tasks ?? []).map(cloneTask));
+      this.tasks.set(month, (data.value?.tasks ?? []).map(normalizeStoredTask));
     }
+    return { failedPaths };
+  }
+  async loadCurrentFolderData() {
+    const configResult = await this.loadConfigFile();
+    this.config = configResult.config;
+    await this.ensureDataFolder();
+    const projectResult = await this.loadProjects();
+    const progressResult = await this.loadProgressPages();
+    const taskResult = await this.loadTasks();
+    return [...configResult.failedPaths, ...projectResult.failedPaths, ...progressResult.failedPaths, ...taskResult.failedPaths].filter(
+      (path, index, list) => list.indexOf(path) === index
+    );
+  }
+  async reloadCurrentFolderData() {
+    await this.refreshFromDisk({ triggerChange: false });
   }
   async ensureDataFolder() {
     const validated = await this.validateDataFolder(this.config.dataFolder);
@@ -629,26 +793,56 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     await this.ensureFolder(this.pathFor(TASKS_DIR));
   }
   pathFor(child) {
-    return (0, import_obsidian.normalizePath)(`${sanitizeFolder(this.config.dataFolder)}/${child}`);
+    return this.pathInFolder(this.config.dataFolder, child);
+  }
+  pathInFolder(folder, child) {
+    return (0, import_obsidian.normalizePath)(`${sanitizeFolder(folder)}/${child}`);
   }
   async ensureFolder(path) {
     const normalized = (0, import_obsidian.normalizePath)(path);
-    if (!this.app.vault.getAbstractFileByPath(normalized)) {
-      await this.app.vault.createFolder(normalized);
+    const existing = this.app.vault.getAbstractFileByPath(normalized);
+    if (existing instanceof import_obsidian.TFolder) {
+      return;
     }
-  }
-  async readJson(path) {
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (!file) {
-      return null;
+    if (existing) {
+      throw new Error(`${normalized} \u5DF2\u88AB\u6587\u4EF6\u5360\u7528`);
+    }
+    const existingStat = await this.app.vault.adapter.stat(normalized);
+    if (existingStat?.type === "folder") {
+      return;
+    }
+    if (existingStat?.type === "file") {
+      throw new Error(`${normalized} \u5DF2\u88AB\u6587\u4EF6\u5360\u7528`);
     }
     try {
-      const raw = await this.app.vault.cachedRead(file);
-      return JSON.parse(raw);
+      await this.app.vault.createFolder(normalized);
+    } catch (error) {
+      const current = this.app.vault.getAbstractFileByPath(normalized);
+      const currentStat = current ? null : await this.app.vault.adapter.stat(normalized);
+      if ((current instanceof import_obsidian.TFolder || currentStat?.type === "folder") && isFolderAlreadyExistsError(error)) {
+        return;
+      }
+      throw error;
+    }
+  }
+  async readJson(path, validate, notifyOnError = true) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    try {
+      const raw = file ? await this.app.vault.cachedRead(file) : await this.readTextFromAdapter(path);
+      if (raw === null) {
+        return { ok: true, value: null };
+      }
+      const parsed = JSON.parse(raw);
+      if (validate && !validate(parsed)) {
+        throw new Error("\u6570\u636E\u7ED3\u6784\u4E0D\u7B26\u5408\u5F53\u524D\u63D2\u4EF6\u683C\u5F0F");
+      }
+      return { ok: true, value: parsed };
     } catch (error) {
       console.error("Failed to read JSON file", path, error);
-      new import_obsidian.Notice(`\u8BFB\u53D6\u6570\u636E\u5931\u8D25: ${path}`);
-      return null;
+      if (notifyOnError) {
+        new import_obsidian.Notice(`\u8BFB\u53D6\u6570\u636E\u5931\u8D25\uFF0C\u5DF2\u505C\u6B62\u81EA\u52A8\u5199\u56DE: ${path}`, 0);
+      }
+      return { ok: false, value: null, path };
     }
   }
   async writeJson(path, data) {
@@ -656,14 +850,17 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     const payload = JSON.stringify(data, null, 2);
     const file = this.app.vault.getAbstractFileByPath(normalized);
     if (!file) {
-      await this.app.vault.create(normalized, payload);
+      await this.app.vault.adapter.write(normalized, payload);
       return;
     }
     await this.app.vault.modify(file, payload);
   }
   async enqueueWrite(job) {
-    this.writeQueue = this.writeQueue.then(job);
-    return this.writeQueue;
+    const run = this.writeQueue.catch(() => void 0).then(job);
+    this.writeQueue = run.catch((error) => {
+      console.error("Project management data write failed", error);
+    });
+    return run;
   }
   async persistMonths(months) {
     const uniqueMonths = [...new Set(months)];
@@ -688,7 +885,7 @@ var ProjectManagementStore = class extends import_obsidian.Events {
   async flushAllTasks() {
     const months = /* @__PURE__ */ new Set([
       ...this.tasks.keys(),
-      ...collectMonthFiles(this.app, this.pathFor(TASKS_DIR))
+      ...await this.collectMonthFiles(this.pathFor(TASKS_DIR))
     ]);
     for (const month of months) {
       await this.flushMonth(month);
@@ -702,22 +899,178 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       await this.flushAllTasks();
     });
   }
+  assertWritable() {
+    if (this.readOnlyReason) {
+      throw new Error(this.readOnlyReason);
+    }
+  }
+  captureDataState() {
+    return {
+      projects: this.projects.map((project) => ({ ...project })),
+      progressPages: this.progressPages.map((page) => ({ ...page, columnOrder: [...page.columnOrder] })),
+      tasks: new Map([...this.tasks.entries()].map(([month, tasks]) => [month, tasks.map(cloneTask)]))
+    };
+  }
+  restoreDataState(state) {
+    this.projects = state.projects.map((project) => ({ ...project }));
+    this.progressPages = state.progressPages.map((page) => ({ ...page, columnOrder: [...page.columnOrder] }));
+    this.tasks = new Map([...state.tasks.entries()].map(([month, tasks]) => [month, tasks.map(cloneTask)]));
+  }
+  async inspectDataFolder(folder) {
+    const normalized = (0, import_obsidian.normalizePath)(sanitizeFolder(folder));
+    const abstract = this.app.vault.getAbstractFileByPath(normalized);
+    const stat = abstract ? null : await this.app.vault.adapter.stat(normalized);
+    if (abstract && !(abstract instanceof import_obsidian.TFolder) || !abstract && stat && stat.type !== "folder") {
+      return { hasData: true, invalidPaths: [normalized] };
+    }
+    if (!abstract && !stat) {
+      return { hasData: false, invalidPaths: [] };
+    }
+    const invalidPaths = [];
+    let hasData = false;
+    const check = async (path, validate) => {
+      const current = this.app.vault.getAbstractFileByPath(path);
+      const currentStat = current ? null : await this.app.vault.adapter.stat(path);
+      if (current && current instanceof import_obsidian.TFolder) {
+        hasData = true;
+        invalidPaths.push(path);
+        return;
+      }
+      if (!current && !currentStat) {
+        return;
+      }
+      hasData = true;
+      const result = await this.readJson(path, validate, false);
+      if (!result.ok) {
+        invalidPaths.push(path);
+      }
+    };
+    await check(this.pathInFolder(folder, CONFIG_FILE), isPartialPluginConfig);
+    await check(this.pathInFolder(folder, PROJECTS_FILE), isProjectsFile);
+    await check(this.pathInFolder(folder, PROGRESS_FILE), isProgressPagesFile);
+    const tasksPath = this.pathInFolder(folder, TASKS_DIR);
+    const tasksFolder = this.app.vault.getAbstractFileByPath(tasksPath);
+    const tasksStat = tasksFolder ? null : await this.app.vault.adapter.stat(tasksPath);
+    if (tasksFolder && !(tasksFolder instanceof import_obsidian.TFolder) || !tasksFolder && tasksStat && tasksStat.type !== "folder") {
+      hasData = true;
+      invalidPaths.push(tasksPath);
+    } else {
+      const monthFiles = await this.collectMonthFilePaths(tasksPath);
+      for (const childPath of monthFiles) {
+        hasData = true;
+        const result = await this.readJson(childPath, isTasksFile, false);
+        if (!result.ok) {
+          invalidPaths.push(childPath);
+        }
+      }
+    }
+    return { hasData, invalidPaths };
+  }
+  async readTextFromAdapter(path) {
+    const normalized = (0, import_obsidian.normalizePath)(path);
+    const stat = await this.app.vault.adapter.stat(normalized);
+    if (!stat) {
+      return null;
+    }
+    if (stat.type !== "file") {
+      throw new Error(`${normalized} \u4E0D\u662F\u6587\u4EF6`);
+    }
+    return this.app.vault.adapter.read(normalized);
+  }
+  async listFolderEntries(path) {
+    try {
+      const listed = await this.app.vault.adapter.list((0, import_obsidian.normalizePath)(path));
+      return [
+        ...listed.folders.map((folder) => ({ name: folder.split("/").pop() ?? folder, isFolder: true })),
+        ...listed.files.map((file) => ({ name: file.split("/").pop() ?? file, isFolder: false }))
+      ];
+    } catch {
+      return [];
+    }
+  }
+  async collectMonthFilePaths(tasksFolder) {
+    const folder = this.app.vault.getAbstractFileByPath(tasksFolder);
+    if (folder instanceof import_obsidian.TFolder) {
+      return folder.children.filter((child) => !(child instanceof import_obsidian.TFolder) && child.name.endsWith(".json")).map((child) => child.path);
+    }
+    const entries = await this.listFolderEntries(tasksFolder);
+    return entries.filter((child) => !child.isFolder && child.name.endsWith(".json")).map((child) => (0, import_obsidian.normalizePath)(`${tasksFolder}/${child.name}`));
+  }
+  async collectMonthFiles(tasksFolder) {
+    const paths = await this.collectMonthFilePaths(tasksFolder);
+    return paths.map((path) => path.split("/").pop()?.replace(/\.json$/, "") ?? "").filter(Boolean);
+  }
 };
+function normalizeStoredTask(task) {
+  const kind = task.kind ?? ((task.subtasks?.length ?? 0) > 0 ? "composite" : "simple");
+  const subtasks = (task.subtasks ?? []).map((item) => ({ id: item.id, title: item.title }));
+  const legacyStates = (task.completedOccurrences ?? []).map(
+    (item) => buildNormalizedOccurrenceState(item.date, kind, subtasks, subtasks.map((subtask) => subtask.id), item.completedAt)
+  );
+  const occurrenceStates = (task.occurrenceStates ?? legacyStates).map(
+    (item) => buildNormalizedOccurrenceState(item.date, kind, subtasks, item.completedSubtaskIds ?? subtasks.map((subtask) => subtask.id), item.completedAt ?? null)
+  );
+  return {
+    ...task,
+    kind,
+    subtasks,
+    occurrenceStates
+  };
+}
+function isPartialPluginConfig(value) {
+  return isRecord(value);
+}
+function isProjectsFile(value) {
+  return isRecord(value) && Array.isArray(value.projects) && value.projects.every(isRecord);
+}
+function isProgressPagesFile(value) {
+  return isRecord(value) && Array.isArray(value.pages) && value.pages.every(isRecord);
+}
+function isTasksFile(value) {
+  return isRecord(value) && typeof value.month === "string" && Array.isArray(value.tasks) && value.tasks.every(isStoredTaskRecord);
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isStoredTaskRecord(value) {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const subtasks = value.subtasks;
+  const occurrenceStates = value.occurrenceStates;
+  const completedOccurrences = value.completedOccurrences;
+  return typeof value.id === "string" && typeof value.title === "string" && typeof value.date === "string" && typeof value.recurrence === "string" && Array.isArray(value.occurrenceDates) && value.occurrenceDates.every((date) => typeof date === "string") && (subtasks === void 0 || Array.isArray(subtasks) && subtasks.every(isTaskSubtaskRecord)) && (occurrenceStates === void 0 || Array.isArray(occurrenceStates) && occurrenceStates.every(isOccurrenceStateRecord)) && (completedOccurrences === void 0 || Array.isArray(completedOccurrences) && completedOccurrences.every(isCompletedOccurrenceRecord));
+}
+function isTaskSubtaskRecord(value) {
+  return isRecord(value) && typeof value.id === "string" && typeof value.title === "string";
+}
+function isOccurrenceStateRecord(value) {
+  return isRecord(value) && typeof value.date === "string";
+}
+function isCompletedOccurrenceRecord(value) {
+  return isRecord(value) && typeof value.date === "string" && typeof value.completedAt === "string";
+}
 function cloneTask(task) {
   return {
     ...task,
+    subtasks: task.subtasks.map((item) => ({ ...item })),
     occurrenceDates: [...task.occurrenceDates],
-    completedOccurrences: task.completedOccurrences.map((item) => ({ ...item }))
+    occurrenceStates: task.occurrenceStates.map((item) => ({
+      ...item,
+      completedSubtaskIds: [...item.completedSubtaskIds ?? []]
+    }))
   };
 }
 function expandTask(task) {
   return task.occurrenceDates.map((date, index) => {
-    const completedRecord = task.completedOccurrences.find((item) => item.date === date);
+    const state = getOccurrenceState(task, date);
+    const progress = getOccurrenceProgress(task, date);
     return {
       id: buildOccurrenceKey(task.id, date),
       taskId: task.id,
       occurrenceDate: date,
       occurrenceNumber: index + 1,
+      kind: task.kind,
       title: task.title,
       description: task.description,
       projectId: task.projectId,
@@ -727,8 +1080,13 @@ function expandTask(task) {
       recurrence: task.recurrence,
       recurrenceCount: task.recurrenceCount ?? null,
       recurrenceUntil: task.recurrenceUntil ?? null,
-      completed: Boolean(completedRecord),
-      completedAt: completedRecord?.completedAt ?? null,
+      subtasks: task.subtasks.map((item) => ({ ...item })),
+      completedSubtaskIds: [...progress.completedSubtaskIds],
+      progress: progress.progress,
+      totalSteps: progress.totalSteps,
+      completedSteps: progress.completedSteps,
+      completed: progress.completed,
+      completedAt: state?.completedAt ?? null,
       createdAt: task.createdAt,
       updatedAt: task.updatedAt
     };
@@ -766,23 +1124,120 @@ function buildOccurrenceDates(input) {
   }
   return dates;
 }
-function resolveCompletedOccurrences(params) {
-  const { input, original, occurrenceDates, timestamp, completedPatch } = params;
+function resolveOccurrenceStates(params) {
+  const { input, original, subtasks, occurrenceDates, timestamp, completedPatch } = params;
   if (completedPatch === true || original === void 0 && input.completed) {
-    return occurrenceDates.map((date) => ({ date, completedAt: timestamp }));
+    return occurrenceDates.map((date) => buildNormalizedOccurrenceState(date, input.kind ?? "simple", subtasks, subtasks.map((item) => item.id), timestamp));
   }
   if (completedPatch === false) {
     return [];
   }
-  const existing = new Map((original?.completedOccurrences ?? []).map((item) => [item.date, item.completedAt]));
-  return occurrenceDates.filter((date) => existing.has(date)).map((date) => ({ date, completedAt: existing.get(date) }));
+  return occurrenceDates.map((date) => {
+    const existing = getOccurrenceState(original, date);
+    if (!existing) {
+      return null;
+    }
+    return buildNormalizedOccurrenceState(
+      date,
+      input.kind ?? "simple",
+      subtasks,
+      existing.completedSubtaskIds ?? (original ? getAllSubtaskIds(original) : []),
+      existing.completedAt ?? null
+    );
+  }).filter((item) => Boolean(item));
 }
-function upsertCompletionRecord(records, date, completedAt) {
-  const existing = records.find((item) => item.date === date);
-  if (existing) {
-    return records.map((item) => item.date === date ? { ...item, completedAt } : { ...item });
+function normalizeSubtaskInputs(subtasks, kind) {
+  if (kind === "simple") {
+    return [];
   }
-  return [...records.map((item) => ({ ...item })), { date, completedAt }];
+  const normalized = (subtasks ?? []).map((item) => ({ id: item.id, title: item.title.trim() })).filter((item) => item.title.length > 0);
+  if (normalized.length === 0) {
+    throw new Error("\u7EC4\u5408\u4EFB\u52A1\u81F3\u5C11\u9700\u8981\u4E00\u4E2A\u5B50\u4EFB\u52A1");
+  }
+  return normalized;
+}
+function resolveTaskSubtasks(inputSubtasks, kind, originalSubtasks) {
+  if (kind === "simple") {
+    return [];
+  }
+  return (inputSubtasks ?? []).map((item) => {
+    const original = item.id ? originalSubtasks.find((entry) => entry.id === item.id) : void 0;
+    return {
+      id: original?.id ?? item.id ?? crypto.randomUUID(),
+      title: item.title.trim()
+    };
+  });
+}
+function getOccurrenceState(task, date) {
+  return task?.occurrenceStates.find((item) => item.date === date);
+}
+function getAllSubtaskIds(task) {
+  if (task.kind === "composite") {
+    return task.subtasks.map((item) => item.id);
+  }
+  return [];
+}
+function buildNormalizedOccurrenceState(date, kind, subtasks, completedSubtaskIds, completedAt) {
+  if (kind === "simple") {
+    return {
+      date,
+      completedAt: completedAt ?? toIsoLocal(now())
+    };
+  }
+  const allowedIds = new Set(subtasks.map((item) => item.id));
+  const uniqueIds = [...new Set(completedSubtaskIds)].filter((id) => allowedIds.has(id));
+  const isComplete = uniqueIds.length === subtasks.length;
+  return {
+    date,
+    completedSubtaskIds: uniqueIds,
+    completedAt: isComplete ? completedAt ?? toIsoLocal(now()) : null
+  };
+}
+function upsertOccurrenceState(task, date, patch) {
+  const nextState = buildNormalizedOccurrenceState(date, task.kind, task.subtasks, patch.completedSubtaskIds, patch.completedAt);
+  const existing = getOccurrenceState(task, date);
+  if (existing) {
+    return task.occurrenceStates.map(
+      (item) => item.date === date ? nextState : {
+        ...item,
+        completedSubtaskIds: [...item.completedSubtaskIds ?? []]
+      }
+    );
+  }
+  return [...task.occurrenceStates.map((item) => ({ ...item, completedSubtaskIds: [...item.completedSubtaskIds ?? []] })), nextState];
+}
+function getOccurrenceProgress(task, date) {
+  if (task.kind === "simple") {
+    const completed = Boolean(getOccurrenceState(task, date));
+    return {
+      completed,
+      progress: completed ? 1 : 0,
+      totalSteps: 1,
+      completedSteps: completed ? 1 : 0,
+      completedSubtaskIds: []
+    };
+  }
+  const totalSteps = Math.max(task.subtasks.length, 1);
+  const allowedIds = new Set(task.subtasks.map((item) => item.id));
+  const completedSubtaskIds = [...new Set(getOccurrenceState(task, date)?.completedSubtaskIds ?? [])].filter((id) => allowedIds.has(id));
+  const completedSteps = completedSubtaskIds.length;
+  return {
+    completed: completedSteps === totalSteps,
+    progress: completedSteps / totalSteps,
+    totalSteps,
+    completedSteps,
+    completedSubtaskIds
+  };
+}
+function summarizeOccurrencesProgress(occurrences) {
+  return occurrences.reduce(
+    (summary, occurrence) => {
+      summary.totalSteps += occurrence.totalSteps;
+      summary.completedSteps += occurrence.completedSteps;
+      return summary;
+    },
+    { totalSteps: 0, completedSteps: 0 }
+  );
 }
 function buildOccurrenceKey(taskId, date) {
   return `${taskId}::${date}`;
@@ -791,7 +1246,7 @@ function occurrenceKeysForTask(task) {
   return new Set(task.occurrenceDates.map((date) => buildOccurrenceKey(task.id, date)));
 }
 function isTaskFullyCompleted(task) {
-  return task.occurrenceDates.length > 0 && task.completedOccurrences.length === task.occurrenceDates.length;
+  return task.occurrenceDates.length > 0 && task.occurrenceDates.every((date) => getOccurrenceProgress(task, date).completed);
 }
 function detectRecurrenceFromDates(dates) {
   if (dates.length <= 1) {
@@ -830,15 +1285,12 @@ function normalizeDateOrUndefined(value) {
   }
   return trimmed;
 }
-function collectMonthFiles(app, tasksFolder) {
-  const folder = app.vault.getAbstractFileByPath(tasksFolder);
-  if (!(folder instanceof import_obsidian.TFolder)) {
-    return [];
-  }
-  return folder.children.filter((child) => !(child instanceof import_obsidian.TFolder) && child.name.endsWith(".json")).map((child) => child.name.replace(/\.json$/, ""));
-}
 function sanitizeFolder(value) {
   return value.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+}
+function isFolderAlreadyExistsError(error) {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return message.includes("folder already exists") || message.includes("already exists");
 }
 function toMonthKeyFromTask(task) {
   return task.date.slice(0, 7);
@@ -899,7 +1351,7 @@ var ProjectManagementSettingTab = class extends import_obsidian2.PluginSettingTa
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "\u9879\u76EE\u7BA1\u7406\u63D2\u4EF6\u8BBE\u7F6E" });
-    new import_obsidian2.Setting(containerEl).setName("\u6570\u636E\u76EE\u5F55\u8DEF\u5F84").setDesc("\u5FC5\u987B\u662F\u5F53\u524D Vault \u5185\u76F8\u5BF9\u8DEF\u5F84\u3002\u76EE\u5F55\u4E0D\u5B58\u5728\u4F1A\u81EA\u52A8\u521B\u5EFA\uFF0C\u76EE\u5F55\u5185\u5B58\u5728\u975E\u63D2\u4EF6\u6587\u4EF6\u4F1A\u62D2\u7EDD\u4F7F\u7528\u3002").addText(
+    new import_obsidian2.Setting(containerEl).setName("\u6570\u636E\u76EE\u5F55\u8DEF\u5F84").setDesc("\u5FC5\u987B\u662F\u5F53\u524D Vault \u5185\u76F8\u5BF9\u8DEF\u5F84\u3002\u76EE\u6807\u76EE\u5F55\u5DF2\u6709\u6709\u6548\u63D2\u4EF6\u6570\u636E\u65F6\u4F1A\u76F4\u63A5\u52A0\u8F7D\uFF1B\u76EE\u5F55\u4E0D\u5B58\u5728\u3001\u4E3A\u7A7A\u6216\u63D2\u4EF6\u6570\u636E\u635F\u574F\u65F6\u4F1A\u7528\u5F53\u524D\u6570\u636E\u521B\u5EFA\u65B0\u6587\u4EF6\u3002").addText(
       (text) => text.setValue(this.plugin.settings.dataFolder).onChange(async (value) => {
         this.plugin.pendingSettings.dataFolder = value.trim();
       })
@@ -1065,6 +1517,8 @@ var TaskModal = class extends import_obsidian5.Modal {
     contentEl.addClass("pm-modal");
     contentEl.createEl("h2", { text: this.options.title });
     const state = { ...this.options.initial };
+    state.kind = state.kind ?? "simple";
+    state.subtasks = [...state.subtasks ?? []];
     const saveScope = "series";
     if (this.options.existingTask?.occurrenceDates.length && this.options.existingTask.occurrenceDates.length > 1) {
       contentEl.createDiv({
@@ -1077,6 +1531,19 @@ var TaskModal = class extends import_obsidian5.Modal {
         state.title = value;
       })
     );
+    new import_obsidian5.Setting(contentEl).setName("\u4EFB\u52A1\u7C7B\u578B").setDesc("\u666E\u901A\u4EFB\u52A1\u76F4\u63A5\u52FE\u9009\u5B8C\u6210\uFF1B\u7EC4\u5408\u4EFB\u52A1\u53EF\u62C6\u6210\u591A\u4E2A\u5B50\u4EFB\u52A1\u5206\u522B\u5B8C\u6210").addDropdown((dropdown) => {
+      const labels = {
+        simple: "\u666E\u901A\u4EFB\u52A1",
+        composite: "\u7EC4\u5408\u4EFB\u52A1"
+      };
+      Object.keys(labels).forEach((key) => dropdown.addOption(key, labels[key]));
+      dropdown.setValue(state.kind ?? "simple");
+      dropdown.onChange((value) => {
+        state.kind = value;
+        state.subtasks = state.kind === "composite" ? state.subtasks ?? [{ title: "" }] : [];
+        renderSubtaskFields();
+      });
+    });
     new import_obsidian5.Setting(contentEl).setName("\u63CF\u8FF0").addTextArea(
       (text) => text.setValue(state.description ?? "").onChange((value) => {
         state.description = value;
@@ -1119,23 +1586,65 @@ var TaskModal = class extends import_obsidian5.Modal {
           state.recurrenceCount = null;
           state.recurrenceUntil = null;
         }
+        renderRecurrenceFields();
       });
     });
-    new import_obsidian5.Setting(contentEl).setName("\u91CD\u590D\u6B21\u6570").setDesc("\u91CD\u590D\u4EFB\u52A1\u81F3\u5C11\u586B\u5199\u6B21\u6570\u6216\u7ED3\u675F\u65E5\u671F\u4E4B\u4E00").addText(
-      (text) => text.setPlaceholder("\u4F8B\u5982 10").setValue(state.recurrenceCount ? String(state.recurrenceCount) : "").onChange((value) => {
-        state.recurrenceCount = value.trim() ? Number(value) : null;
-      })
-    );
-    new import_obsidian5.Setting(contentEl).setName("\u91CD\u590D\u7ED3\u675F\u65E5\u671F").addText(
-      (text) => text.setPlaceholder("YYYY-MM-DD").setValue(state.recurrenceUntil ?? "").onChange((value) => {
-        state.recurrenceUntil = value.trim() || null;
-      })
-    );
-    new import_obsidian5.Setting(contentEl).setName("\u5B8C\u6210\u72B6\u6001").addToggle(
-      (toggle) => toggle.setValue(Boolean(state.completed)).onChange((value) => {
-        state.completed = value;
-      })
-    );
+    const recurrenceFields = contentEl.createDiv();
+    const subtaskFields = contentEl.createDiv();
+    const renderRecurrenceFields = () => {
+      recurrenceFields.empty();
+      if (state.recurrence === "once") {
+        return;
+      }
+      new import_obsidian5.Setting(recurrenceFields).setName("\u91CD\u590D\u6B21\u6570").setDesc("\u91CD\u590D\u4EFB\u52A1\u81F3\u5C11\u586B\u5199\u6B21\u6570\u6216\u7ED3\u675F\u65E5\u671F\u4E4B\u4E00").addText(
+        (text) => text.setPlaceholder("\u4F8B\u5982 10").setValue(state.recurrenceCount ? String(state.recurrenceCount) : "").onChange((value) => {
+          state.recurrenceCount = value.trim() ? Number(value) : null;
+        })
+      );
+      new import_obsidian5.Setting(recurrenceFields).setName("\u91CD\u590D\u7ED3\u675F\u65E5\u671F").addText(
+        (text) => text.setPlaceholder("YYYY-MM-DD").setValue(state.recurrenceUntil ?? "").onChange((value) => {
+          state.recurrenceUntil = value.trim() || null;
+        })
+      );
+    };
+    renderRecurrenceFields();
+    const renderSubtaskFields = () => {
+      subtaskFields.empty();
+      if (state.kind !== "composite") {
+        return;
+      }
+      subtaskFields.addClass("pm-subtask-editor");
+      subtaskFields.createDiv({ cls: "pm-muted", text: "\u7EC4\u5408\u4EFB\u52A1\u4F1A\u5728\u5468\u4EFB\u52A1\u56FE\u548C\u4ECA\u65E5\u4EFB\u52A1\u4E2D\u6E32\u67D3\u4E3A\u4E00\u4E2A\u5927\u6846\uFF0C\u5185\u90E8\u5B50\u4EFB\u52A1\u53EF\u5355\u72EC\u52FE\u9009\u5B8C\u6210\u3002" });
+      const list = subtaskFields.createDiv({ cls: "pm-subtask-editor-list" });
+      const subtasks = state.subtasks ?? [];
+      subtasks.forEach((subtask, index) => {
+        const row = list.createDiv({ cls: "pm-subtask-editor-row" });
+        row.createSpan({ cls: "pm-subtask-editor-index", text: `${index + 1}.` });
+        const input = row.createEl("input", {
+          type: "text",
+          placeholder: `\u5B50\u4EFB\u52A1 ${index + 1}`
+        });
+        input.value = subtask.title;
+        input.addEventListener("input", () => {
+          subtasks[index] = {
+            ...subtasks[index],
+            title: input.value
+          };
+          state.subtasks = [...subtasks];
+        });
+        row.createEl("button", { text: "\u5220\u9664", cls: "mod-warning" }).addEventListener("click", () => {
+          subtasks.splice(index, 1);
+          state.subtasks = [...subtasks];
+          renderSubtaskFields();
+        });
+      });
+      const actions = subtaskFields.createDiv({ cls: "pm-inline-actions" });
+      actions.createEl("button", { text: "\u65B0\u589E\u5B50\u4EFB\u52A1" }).addEventListener("click", () => {
+        state.subtasks = [...state.subtasks ?? [], { title: "" }];
+        renderSubtaskFields();
+      });
+    };
+    renderSubtaskFields();
     const footer = contentEl.createDiv({ cls: "pm-modal-actions" });
     new import_obsidian5.ButtonComponent(footer).setButtonText("\u4FDD\u5B58").setCta().onClick(async () => {
       try {
@@ -1146,12 +1655,14 @@ var TaskModal = class extends import_obsidian5.Modal {
       }
     });
     if (this.options.onDelete) {
-      new import_obsidian5.ButtonComponent(footer).setButtonText("\u5220\u9664\u672C\u6B21").setWarning().onClick(async () => {
-        await this.options.onDelete?.("single");
-        this.close();
-      });
+      if (this.options.allowSingleDelete) {
+        new import_obsidian5.ButtonComponent(footer).setButtonText("\u5220\u9664\u672C\u6B21\u5B9E\u4F8B").setWarning().onClick(async () => {
+          await this.options.onDelete?.("single");
+          this.close();
+        });
+      }
       if (this.options.existingTask?.occurrenceDates.length && this.options.existingTask.occurrenceDates.length > 1) {
-        new import_obsidian5.ButtonComponent(footer).setButtonText(this.options.occurrenceContext ? "\u5220\u9664\u6574\u4E2A\u4EFB\u52A1" : "\u5220\u9664\u6574\u4E2A\u4EFB\u52A1").setWarning().onClick(async () => {
+        new import_obsidian5.ButtonComponent(footer).setButtonText("\u5220\u9664\u6574\u4E2A\u7CFB\u5217").setWarning().onClick(async () => {
           await this.options.onDelete?.("series");
           this.close();
         });
@@ -1254,8 +1765,9 @@ var OverviewView = class extends BaseProjectView {
     const weekSection = container.createDiv({ cls: "pm-section" });
     const top = weekSection.createDiv({ cls: "pm-week-header" });
     const left = top.createDiv();
+    const weekDates = getWeekDates(this.weekAnchor);
     left.createEl("h3", { text: "\u5468\u4EFB\u52A1\u56FE" });
-    left.createDiv({ cls: "pm-muted", text: `${formatWeekColumnTitle(getWeekDates(this.weekAnchor)[0])} \u5F00\u59CB` });
+    left.createDiv({ cls: "pm-muted", text: `${toDateKey(weekDates[0])} \u81F3 ${toDateKey(weekDates[6])}` });
     const controls = top.createDiv({ cls: "pm-week-controls" });
     controls.createEl("button", { text: "\u4E0A\u4E00\u5468" }).addEventListener("click", () => {
       this.weekAnchor = addDays(this.weekAnchor, -7);
@@ -1330,7 +1842,19 @@ var OverviewView = class extends BaseProjectView {
       };
     });
     const max = Math.max(1, ...dailyTotals.map((item) => Math.max(item.total, item.completed)));
-    const chart = container.createDiv({ cls: "pm-line-chart" });
+    const yAxisValues = buildYAxisValues(max);
+    const legend = container.createDiv({ cls: "pm-line-chart-legend" });
+    [
+      { label: "\u4EFB\u52A1\u603B\u6570", cls: "pm-line-chart-total" },
+      { label: "\u5DF2\u5B8C\u6210", cls: "pm-line-chart-completed" }
+    ].forEach((item) => {
+      const chip = legend.createDiv({ cls: `pm-line-chart-legend-item ${item.cls}` });
+      chip.createSpan({ text: item.label });
+    });
+    const chartLayout = container.createDiv({ cls: "pm-line-chart-layout" });
+    const axis = chartLayout.createDiv({ cls: "pm-line-chart-axis" });
+    yAxisValues.forEach((value) => axis.createDiv({ text: String(value) }));
+    const chart = chartLayout.createDiv({ cls: "pm-line-chart" });
     const svg = chart.createSvg("svg", {
       attr: {
         viewBox: "0 0 900 240",
@@ -1338,8 +1862,32 @@ var OverviewView = class extends BaseProjectView {
         "aria-label": "\u6700\u8FD1 30 \u5929\u4EFB\u52A1\u8D8B\u52BF\u56FE"
       }
     });
+    yAxisValues.forEach((value) => {
+      const y = valueToChartY(value, max);
+      svg.createSvg("line", {
+        attr: {
+          x1: "20",
+          y1: String(y),
+          x2: "880",
+          y2: String(y),
+          class: "pm-line-chart-gridline"
+        }
+      });
+    });
     svg.createSvg("polyline", { attr: { points: dailyTotals.map((item, index) => toChartPoint(index, item.total, max)).join(" "), class: "pm-line-chart-total" } });
     svg.createSvg("polyline", { attr: { points: dailyTotals.map((item, index) => toChartPoint(index, item.completed, max)).join(" "), class: "pm-line-chart-completed" } });
+    dailyTotals.forEach((item, index) => {
+      const totalPoint = toChartCoordinates(index, item.total, max);
+      const completedPoint = toChartCoordinates(index, item.completed, max);
+      const totalDot = svg.createSvg("circle", {
+        attr: { cx: String(totalPoint.x), cy: String(totalPoint.y), r: "4", class: "pm-line-chart-point pm-line-chart-total" }
+      });
+      totalDot.createSvg("title").textContent = `${item.key}\uFF1A\u4EFB\u52A1 ${item.total}\uFF0C\u5B8C\u6210 ${item.completed}`;
+      const completedDot = svg.createSvg("circle", {
+        attr: { cx: String(completedPoint.x), cy: String(completedPoint.y), r: "4", class: "pm-line-chart-point pm-line-chart-completed" }
+      });
+      completedDot.createSvg("title").textContent = `${item.key}\uFF1A\u4EFB\u52A1 ${item.total}\uFF0C\u5B8C\u6210 ${item.completed}`;
+    });
     const labels = container.createDiv({ cls: "pm-line-chart-labels" });
     dailyTotals.forEach((item, index) => {
       const label = labels.createDiv({ cls: "pm-line-chart-label" });
@@ -1362,12 +1910,11 @@ var OverviewView = class extends BaseProjectView {
           isWeekend(date) ? "is-weekend" : ""
         ].filter(Boolean).join(" ")
       });
-      const title = column.createDiv({ cls: "pm-week-day-title" });
-      title.createSpan({ text: formatWeekColumnTitle(date) });
-      if (isToday(key)) {
-        title.createSpan({ text: "\u4ECA\u5929", cls: "pm-tag pm-tag-today" });
-      }
-      column.createEl("button", { text: "\u65B0\u589E\u4EFB\u52A1", cls: "mod-cta" }).addEventListener("click", () => {
+      const header = column.createDiv({ cls: "pm-week-day-header" });
+      const title = header.createDiv({ cls: "pm-week-day-title" });
+      title.createSpan({ text: getChineseWeekday(date), cls: "pm-week-day-weekday" });
+      title.createSpan({ text: key, cls: "pm-week-day-date" });
+      header.createEl("button", { text: "\u65B0\u589E", cls: "mod-cta pm-week-day-add" }).addEventListener("click", () => {
         this.openCreateTaskModal("\u65B0\u589E\u4EFB\u52A1", projects, {
           title: "",
           description: "",
@@ -1379,7 +1926,7 @@ var OverviewView = class extends BaseProjectView {
       });
       const dayTasks = tasks.filter((task) => task.date === key).sort(compareWeekTasks);
       if (dayTasks.length === 0) {
-        column.createDiv({ cls: "pm-empty", text: "\u6682\u65E0\u4EFB\u52A1" });
+        column.createDiv({ cls: "pm-empty pm-week-day-empty", text: "\u6682\u65E0\u4EFB\u52A1" });
         return;
       }
       const list = column.createDiv({ cls: "pm-week-day-list" });
@@ -1388,31 +1935,57 @@ var OverviewView = class extends BaseProjectView {
   }
   renderWeekTaskCard(container, task) {
     const project = this.plugin.store.getProject(task.projectId);
-    const card = container.createDiv({ cls: `pm-week-task ${task.completed ? "is-complete" : ""}` });
+    const card = container.createDiv({ cls: `pm-week-task ${task.completed ? "is-complete" : ""} ${task.kind === "composite" ? "is-composite" : ""}` });
     if (project?.color) {
       card.style.borderLeftColor = project.color;
     }
     const top = card.createDiv({ cls: "pm-week-task-top" });
-    const checkbox = top.createEl("input", { type: "checkbox" });
-    checkbox.checked = task.completed;
-    checkbox.addEventListener("change", async () => {
-      try {
-        await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
-      } catch (error) {
-        checkbox.checked = !checkbox.checked;
-        new import_obsidian7.Notice(error instanceof Error ? error.message : "\u66F4\u65B0\u5931\u8D25");
-      }
-    });
-    top.createSpan({ text: task.title, cls: "pm-task-title" });
-    top.createSpan({ text: recurrenceLabel2(task.recurrence), cls: "pm-tag" });
+    if (task.kind === "simple") {
+      const checkbox = top.createEl("input", { type: "checkbox" });
+      checkbox.checked = task.completed;
+      checkbox.addEventListener("change", async () => {
+        try {
+          await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
+        } catch (error) {
+          checkbox.checked = !checkbox.checked;
+          new import_obsidian7.Notice(error instanceof Error ? error.message : "\u66F4\u65B0\u5931\u8D25");
+        }
+      });
+    }
+    const titleLine = top.createDiv({ cls: "pm-week-task-title-line" });
+    titleLine.createSpan({ text: task.title, cls: "pm-task-title" });
+    titleLine.createSpan({ text: recurrenceLabel2(task.recurrence), cls: "pm-tag pm-week-recurrence-tag" });
+    const editButton = top.createEl("button", { text: "\u270E", cls: "pm-week-task-edit" });
+    editButton.setAttribute("aria-label", "\u7F16\u8F91\u4EFB\u52A1");
+    editButton.title = "\u7F16\u8F91\u4EFB\u52A1";
+    editButton.addEventListener("click", () => this.openEditOccurrenceModal(task));
     const meta = card.createDiv({ cls: "pm-task-meta" });
     meta.createSpan({ text: task.startTime && task.endTime ? `${task.startTime} - ${task.endTime}` : "\u672A\u6392\u671F" });
     meta.createSpan({ text: project?.name ?? "\u672A\u5F52\u5C5E\u9879\u76EE" });
     if (task.recurrence !== "once") {
       meta.createSpan({ text: `\u7B2C ${task.occurrenceNumber} \u6B21` });
     }
-    const actions = card.createDiv({ cls: "pm-task-actions" });
-    actions.createEl("button", { text: "\u7F16\u8F91" }).addEventListener("click", () => this.openEditOccurrenceModal(task));
+    if (task.kind === "composite") {
+      meta.createSpan({ text: `${task.completedSteps}/${task.totalSteps} \u5B50\u4EFB\u52A1` });
+      this.renderCompositeSubtasks(card, task);
+    }
+  }
+  renderCompositeSubtasks(container, task) {
+    const grid = container.createDiv({ cls: "pm-subtask-grid" });
+    task.subtasks.forEach((subtask) => {
+      const item = grid.createEl("button", {
+        text: subtask.title,
+        cls: `pm-subtask-chip ${task.completedSubtaskIds.includes(subtask.id) ? "is-complete" : ""}`
+      });
+      item.addEventListener("click", async () => {
+        const completed = !task.completedSubtaskIds.includes(subtask.id);
+        try {
+          await this.plugin.store.updateTaskOccurrenceSubtaskCompletion(task.taskId, task.date, subtask.id, completed);
+        } catch (error) {
+          new import_obsidian7.Notice(error instanceof Error ? error.message : "\u66F4\u65B0\u5931\u8D25");
+        }
+      });
+    });
   }
   renderProjectsTab(container, pages, projects, allTasks) {
     const header = container.createDiv({ cls: "pm-page-header" });
@@ -1547,7 +2120,9 @@ var OverviewView = class extends BaseProjectView {
         recurrence: task.recurrence,
         recurrenceCount: task.recurrenceCount ?? null,
         recurrenceUntil: task.recurrenceUntil ?? null,
-        completed: task.occurrenceDates.length > 0 && task.completedOccurrences.length === task.occurrenceDates.length
+        kind: task.kind,
+        subtasks: task.subtasks,
+        completed: isTaskSeriesCompleted(task)
       },
       onSubmit: async (input) => {
         await this.plugin.store.updateTask(task.id, input, "series");
@@ -1557,7 +2132,8 @@ var OverviewView = class extends BaseProjectView {
       },
       onCompleteSeries: async () => {
         await this.plugin.store.completeTaskSeries(task.id);
-      }
+      },
+      allowSingleDelete: false
     }).open();
   }
   openEditOccurrenceModal(task) {
@@ -1580,7 +2156,9 @@ var OverviewView = class extends BaseProjectView {
         recurrence: seriesTask.recurrence,
         recurrenceCount: seriesTask.recurrenceCount ?? null,
         recurrenceUntil: seriesTask.recurrenceUntil ?? null,
-        completed: seriesTask.occurrenceDates.length > 0 && seriesTask.completedOccurrences.length === seriesTask.occurrenceDates.length
+        kind: seriesTask.kind,
+        subtasks: seriesTask.subtasks,
+        completed: isTaskSeriesCompleted(seriesTask)
       },
       onSubmit: async (input) => {
         await this.plugin.store.updateTask(seriesTask.id, input, "series");
@@ -1594,7 +2172,8 @@ var OverviewView = class extends BaseProjectView {
       },
       onCompleteSeries: async () => {
         await this.plugin.store.completeTaskSeries(seriesTask.id, task.date);
-      }
+      },
+      allowSingleDelete: true
     }).open();
   }
 };
@@ -1624,6 +2203,11 @@ function buildMonthLabels(weeks) {
     }
   }
   return labels;
+}
+function buildYAxisValues(max) {
+  const steps = 4;
+  const interval = Math.max(1, Math.ceil(max / steps));
+  return Array.from({ length: steps + 1 }, (_, index) => interval * (steps - index));
 }
 function heatLevel(count) {
   if (count <= 0) {
@@ -1682,9 +2266,16 @@ function compareSeriesTasks2(a, b) {
   return startA - startB || a.title.localeCompare(b.title);
 }
 function toChartPoint(index, value, max) {
-  const x = 20 + index * (860 / 29);
-  const y = 210 - value / max * 170;
+  const { x, y } = toChartCoordinates(index, value, max);
   return `${x},${y}`;
+}
+function toChartCoordinates(index, value, max) {
+  const x = 20 + index * (860 / 29);
+  const y = valueToChartY(value, max);
+  return { x, y };
+}
+function valueToChartY(value, max) {
+  return 210 - value / max * 170;
 }
 function scheduleSummary(task) {
   const total = task.occurrenceDates.length;
@@ -1693,7 +2284,24 @@ function scheduleSummary(task) {
   return `${range} | ${time} | \u5171 ${total} \u6B21`;
 }
 function completionSummary(task) {
-  return `${task.completedOccurrences.length}/${task.occurrenceDates.length}`;
+  const totalSteps = task.kind === "composite" ? task.occurrenceDates.length * task.subtasks.length : task.occurrenceDates.length;
+  const completedSteps = task.kind === "composite" ? task.occurrenceStates.reduce((sum, state) => sum + (state.completedSubtaskIds?.length ?? 0), 0) : task.occurrenceStates.length;
+  const ratio = totalSteps === 0 ? 0 : Math.round(completedSteps / totalSteps * 100);
+  const label = task.kind === "composite" ? "\u5B50\u4EFB\u52A1" : "\u6B21";
+  return `${completedSteps}/${totalSteps} ${label} \xB7 ${ratio}%`;
+}
+function isTaskSeriesCompleted(task) {
+  if (task.occurrenceDates.length === 0) {
+    return false;
+  }
+  return task.occurrenceDates.every((date) => {
+    const state = task.occurrenceStates.find((item) => item.date === date);
+    if (task.kind === "simple") {
+      return Boolean(state);
+    }
+    const completedIds = new Set(state?.completedSubtaskIds ?? []);
+    return task.subtasks.every((subtask) => completedIds.has(subtask.id));
+  });
 }
 
 // src/views/todayView.ts
@@ -1720,6 +2328,9 @@ var TodayTasksView = class extends BaseProjectView {
     const tasks = this.plugin.store.getTasksForDate(today);
     const projects = this.plugin.store.getProjects();
     const visibleTasks = this.plugin.settings.showCompletedTasks ? tasks : tasks.filter((task) => !task.completed);
+    const totalSteps = tasks.reduce((sum, task) => sum + task.totalSteps, 0);
+    const completedSteps = tasks.reduce((sum, task) => sum + task.completedSteps, 0);
+    const progress = totalSteps === 0 ? 0 : Math.round(completedSteps / totalSteps * 100);
     const header = container.createDiv({ cls: "pm-page-header" });
     const title = header.createDiv();
     title.createEl("h2", { text: "\u4ECA\u65E5\u4EFB\u52A1" });
@@ -1743,6 +2354,17 @@ var TodayTasksView = class extends BaseProjectView {
         }
       }).open();
     });
+    const progressSection = container.createDiv({ cls: "pm-section" });
+    progressSection.createEl("h3", { text: "\u4ECA\u65E5\u8FDB\u5EA6" });
+    if (tasks.length === 0) {
+      progressSection.createDiv({ cls: "pm-empty", text: "\u4ECA\u5929\u8FD8\u6CA1\u6709\u4EFB\u52A1\uFF0C\u5148\u65B0\u589E\u4E00\u6761\u5F00\u59CB\u5427\u3002" });
+    } else {
+      progressSection.createDiv({ cls: "pm-muted", text: `${completedSteps} / ${totalSteps} \u6B65 \xB7 ${progress}%` });
+      progressSection.createDiv({ cls: "pm-progress-bar" }).createDiv({
+        cls: "pm-progress-bar-fill",
+        attr: { style: `width: ${progress}%` }
+      });
+    }
     const incomplete = visibleTasks.filter((task) => !task.completed);
     const complete = visibleTasks.filter((task) => task.completed);
     this.renderTaskSection(container, "\u672A\u5B8C\u6210", incomplete);
@@ -1757,18 +2379,20 @@ var TodayTasksView = class extends BaseProjectView {
     }
     const list = section.createDiv({ cls: "pm-task-list" });
     tasks.forEach((task) => {
-      const row = list.createDiv({ cls: "pm-task-row" });
+      const row = list.createDiv({ cls: `pm-task-row ${task.kind === "composite" ? "is-composite" : ""}` });
       const left = row.createDiv({ cls: "pm-task-main" });
-      const checkbox = left.createEl("input", { type: "checkbox" });
-      checkbox.checked = task.completed;
-      checkbox.addEventListener("change", async () => {
-        try {
-          await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
-        } catch (error) {
-          checkbox.checked = !checkbox.checked;
-          new import_obsidian8.Notice(error instanceof Error ? error.message : "\u66F4\u65B0\u5931\u8D25");
-        }
-      });
+      if (task.kind === "simple") {
+        const checkbox = left.createEl("input", { type: "checkbox" });
+        checkbox.checked = task.completed;
+        checkbox.addEventListener("change", async () => {
+          try {
+            await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
+          } catch (error) {
+            checkbox.checked = !checkbox.checked;
+            new import_obsidian8.Notice(error instanceof Error ? error.message : "\u66F4\u65B0\u5931\u8D25");
+          }
+        });
+      }
       const info = left.createDiv({ cls: "pm-task-copy" });
       info.createEl("div", { text: task.title, cls: `pm-task-title ${task.completed ? "is-complete" : ""}` });
       const meta = info.createDiv({ cls: "pm-task-meta" });
@@ -1776,6 +2400,10 @@ var TodayTasksView = class extends BaseProjectView {
       meta.createSpan({ text: recurrenceLabel3(task) });
       const project = this.plugin.store.getProject(task.projectId);
       meta.createSpan({ text: project?.name ?? "\u672A\u5F52\u5C5E\u9879\u76EE" });
+      if (task.kind === "composite") {
+        meta.createSpan({ text: `${task.completedSteps}/${task.totalSteps} \u5B50\u4EFB\u52A1` });
+      }
+      this.renderSubtasks(info, task);
       const actions = row.createDiv({ cls: "pm-task-actions" });
       actions.createEl("button", { text: "\u7F16\u8F91" }).addEventListener("click", () => this.openEditor(task));
       actions.createEl("button", { text: "\u5220\u9664", cls: "mod-warning" }).addEventListener("click", async () => {
@@ -1808,7 +2436,9 @@ var TodayTasksView = class extends BaseProjectView {
         recurrence: seriesTask.recurrence,
         recurrenceCount: seriesTask.recurrenceCount ?? null,
         recurrenceUntil: seriesTask.recurrenceUntil ?? null,
-        completed: seriesTask.occurrenceDates.length > 0 && seriesTask.completedOccurrences.length === seriesTask.occurrenceDates.length
+        kind: seriesTask.kind,
+        subtasks: seriesTask.subtasks,
+        completed: isTaskSeriesCompleted2(seriesTask)
       },
       onSubmit: async (input) => {
         await this.plugin.store.updateTask(seriesTask.id, input, "series");
@@ -1822,8 +2452,29 @@ var TodayTasksView = class extends BaseProjectView {
       },
       onCompleteSeries: async () => {
         await this.plugin.store.completeTaskSeries(seriesTask.id, task.date);
-      }
+      },
+      allowSingleDelete: true
     }).open();
+  }
+  renderSubtasks(container, task) {
+    if (task.kind !== "composite") {
+      return;
+    }
+    const grid = container.createDiv({ cls: "pm-subtask-grid" });
+    task.subtasks.forEach((subtask) => {
+      const item = grid.createEl("button", {
+        text: subtask.title,
+        cls: `pm-subtask-chip ${task.completedSubtaskIds.includes(subtask.id) ? "is-complete" : ""}`
+      });
+      item.addEventListener("click", async () => {
+        const completed = !task.completedSubtaskIds.includes(subtask.id);
+        try {
+          await this.plugin.store.updateTaskOccurrenceSubtaskCompletion(task.taskId, task.date, subtask.id, completed);
+        } catch (error) {
+          new import_obsidian8.Notice(error instanceof Error ? error.message : "\u66F4\u65B0\u5931\u8D25");
+        }
+      });
+    });
   }
 };
 function recurrenceLabel3(task) {
@@ -1834,6 +2485,20 @@ function recurrenceLabel3(task) {
     return "\u6BCF\u5468\u6B64\u65F6\u91CD\u590D";
   }
   return "\u5355\u6B21\u4EFB\u52A1";
+}
+function isTaskSeriesCompleted2(task) {
+  if (task.occurrenceDates.length === 0) {
+    return false;
+  }
+  const allSubtaskIds = new Set(task.subtasks.map((item) => item.id));
+  return task.occurrenceDates.every((date) => {
+    const state = task.occurrenceStates.find((item) => item.date === date);
+    if (task.kind === "simple") {
+      return Boolean(state);
+    }
+    const completedIds = new Set(state?.completedSubtaskIds ?? []);
+    return task.subtasks.every((subtask) => completedIds.has(subtask.id)) && completedIds.size === allSubtaskIds.size;
+  });
 }
 
 // src/main.ts
@@ -1854,6 +2519,9 @@ var ProjectManagementPlugin = class extends import_obsidian9.Plugin {
       console.error(error);
       new import_obsidian9.Notice(error instanceof Error ? error.message : "\u63D2\u4EF6\u521D\u59CB\u5316\u5931\u8D25");
     }
+    this.app.workspace.onLayoutReady(() => {
+      void this.refreshStoreFromDisk(false);
+    });
     this.registerView(OVERVIEW_VIEW_TYPE, (leaf) => new OverviewView(leaf, this));
     this.registerView(TODAY_VIEW_TYPE, (leaf) => new TodayTasksView(leaf, this));
     this.addRibbonIcon("layout-dashboard", "\u6253\u5F00\u9879\u76EE\u603B\u89C8", async () => {
@@ -1875,14 +2543,26 @@ var ProjectManagementPlugin = class extends import_obsidian9.Plugin {
     this.addSettingTab(new ProjectManagementSettingTab(this.app, this));
   }
   async onunload() {
+    try {
+      await this.store?.flushPendingWrites();
+    } catch (error) {
+      console.error("Failed to flush project management data before unload", error);
+    }
     await this.app.workspace.detachLeavesOfType(OVERVIEW_VIEW_TYPE);
     await this.app.workspace.detachLeavesOfType(TODAY_VIEW_TYPE);
   }
   async updateSettings(patch) {
-    this.settings = { ...this.settings, ...patch };
+    const previousSettings = { ...this.settings };
+    const nextSettings = { ...this.settings, ...patch };
     this.pendingSettings = {};
-    await this.savePluginSettings();
-    await this.store.setConfig(this.settings);
+    await this.store.setConfig(nextSettings);
+    this.settings = this.store.getConfig();
+    try {
+      await this.savePluginSettings();
+    } catch (error) {
+      this.settings = previousSettings;
+      throw error;
+    }
   }
   async loadPluginSettings() {
     const loaded = await this.loadData();
@@ -1893,9 +2573,11 @@ var ProjectManagementPlugin = class extends import_obsidian9.Plugin {
   }
   async activateOverviewView() {
     await this.activateInMainArea(OVERVIEW_VIEW_TYPE);
+    void this.refreshStoreFromDisk();
   }
   async activateTodayView() {
     await this.activateInRightSidebar(TODAY_VIEW_TYPE);
+    void this.refreshStoreFromDisk();
   }
   async activateInMainArea(type) {
     const leaves = this.app.workspace.getLeavesOfType(type);
@@ -1920,5 +2602,19 @@ var ProjectManagementPlugin = class extends import_obsidian9.Plugin {
     }
     await leaf.setViewState({ type, active: true });
     await this.app.workspace.revealLeaf(leaf);
+  }
+  async refreshStoreFromDisk(notifyOnError = true) {
+    if (!this.store) {
+      return;
+    }
+    try {
+      await this.store.refreshFromDisk();
+      this.settings = this.store.getConfig();
+    } catch (error) {
+      console.error("Failed to refresh project management data from disk", error);
+      if (notifyOnError) {
+        new import_obsidian9.Notice(error instanceof Error ? error.message : "\u5237\u65B0\u6570\u636E\u5931\u8D25");
+      }
+    }
   }
 };

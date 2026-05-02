@@ -8,7 +8,7 @@ import {
   addDays,
   compareDateKeys,
   formatShortMonth,
-  formatWeekColumnTitle,
+  getChineseWeekday,
   getLastTwelveMonthsDays,
   getWeekDates,
   isPastDateKey,
@@ -108,8 +108,9 @@ export class OverviewView extends BaseProjectView {
     const weekSection = container.createDiv({ cls: "pm-section" });
     const top = weekSection.createDiv({ cls: "pm-week-header" });
     const left = top.createDiv();
+    const weekDates = getWeekDates(this.weekAnchor);
     left.createEl("h3", { text: "周任务图" });
-    left.createDiv({ cls: "pm-muted", text: `${formatWeekColumnTitle(getWeekDates(this.weekAnchor)[0])} 开始` });
+    left.createDiv({ cls: "pm-muted", text: `${toDateKey(weekDates[0])} 至 ${toDateKey(weekDates[6])}` });
     const controls = top.createDiv({ cls: "pm-week-controls" });
     controls.createEl("button", { text: "上一周" }).addEventListener("click", () => {
       this.weekAnchor = addDays(this.weekAnchor, -7);
@@ -190,8 +191,22 @@ export class OverviewView extends BaseProjectView {
       };
     });
     const max = Math.max(1, ...dailyTotals.map((item) => Math.max(item.total, item.completed)));
+    const yAxisValues = buildYAxisValues(max);
 
-    const chart = container.createDiv({ cls: "pm-line-chart" });
+    const legend = container.createDiv({ cls: "pm-line-chart-legend" });
+    [
+      { label: "任务总数", cls: "pm-line-chart-total" },
+      { label: "已完成", cls: "pm-line-chart-completed" }
+    ].forEach((item) => {
+      const chip = legend.createDiv({ cls: `pm-line-chart-legend-item ${item.cls}` });
+      chip.createSpan({ text: item.label });
+    });
+
+    const chartLayout = container.createDiv({ cls: "pm-line-chart-layout" });
+    const axis = chartLayout.createDiv({ cls: "pm-line-chart-axis" });
+    yAxisValues.forEach((value) => axis.createDiv({ text: String(value) }));
+
+    const chart = chartLayout.createDiv({ cls: "pm-line-chart" });
     const svg = chart.createSvg("svg", {
       attr: {
         viewBox: "0 0 900 240",
@@ -199,8 +214,32 @@ export class OverviewView extends BaseProjectView {
         "aria-label": "最近 30 天任务趋势图"
       }
     });
+    yAxisValues.forEach((value) => {
+      const y = valueToChartY(value, max);
+      svg.createSvg("line", {
+        attr: {
+          x1: "20",
+          y1: String(y),
+          x2: "880",
+          y2: String(y),
+          class: "pm-line-chart-gridline"
+        }
+      });
+    });
     svg.createSvg("polyline", { attr: { points: dailyTotals.map((item, index) => toChartPoint(index, item.total, max)).join(" "), class: "pm-line-chart-total" } });
     svg.createSvg("polyline", { attr: { points: dailyTotals.map((item, index) => toChartPoint(index, item.completed, max)).join(" "), class: "pm-line-chart-completed" } });
+    dailyTotals.forEach((item, index) => {
+      const totalPoint = toChartCoordinates(index, item.total, max);
+      const completedPoint = toChartCoordinates(index, item.completed, max);
+      const totalDot = svg.createSvg("circle", {
+        attr: { cx: String(totalPoint.x), cy: String(totalPoint.y), r: "4", class: "pm-line-chart-point pm-line-chart-total" }
+      });
+      totalDot.createSvg("title").textContent = `${item.key}：任务 ${item.total}，完成 ${item.completed}`;
+      const completedDot = svg.createSvg("circle", {
+        attr: { cx: String(completedPoint.x), cy: String(completedPoint.y), r: "4", class: "pm-line-chart-point pm-line-chart-completed" }
+      });
+      completedDot.createSvg("title").textContent = `${item.key}：任务 ${item.total}，完成 ${item.completed}`;
+    });
 
     const labels = container.createDiv({ cls: "pm-line-chart-labels" });
     dailyTotals.forEach((item, index) => {
@@ -228,12 +267,11 @@ export class OverviewView extends BaseProjectView {
           .filter(Boolean)
           .join(" ")
       });
-      const title = column.createDiv({ cls: "pm-week-day-title" });
-      title.createSpan({ text: formatWeekColumnTitle(date) });
-      if (isToday(key)) {
-        title.createSpan({ text: "今天", cls: "pm-tag pm-tag-today" });
-      }
-      column.createEl("button", { text: "新增任务", cls: "mod-cta" }).addEventListener("click", () => {
+      const header = column.createDiv({ cls: "pm-week-day-header" });
+      const title = header.createDiv({ cls: "pm-week-day-title" });
+      title.createSpan({ text: getChineseWeekday(date), cls: "pm-week-day-weekday" });
+      title.createSpan({ text: key, cls: "pm-week-day-date" });
+      header.createEl("button", { text: "新增", cls: "mod-cta pm-week-day-add" }).addEventListener("click", () => {
         this.openCreateTaskModal("新增任务", projects, {
           title: "",
           description: "",
@@ -246,7 +284,7 @@ export class OverviewView extends BaseProjectView {
 
       const dayTasks = tasks.filter((task) => task.date === key).sort(compareWeekTasks);
       if (dayTasks.length === 0) {
-        column.createDiv({ cls: "pm-empty", text: "暂无任务" });
+        column.createDiv({ cls: "pm-empty pm-week-day-empty", text: "暂无任务" });
         return;
       }
 
@@ -257,24 +295,31 @@ export class OverviewView extends BaseProjectView {
 
   private renderWeekTaskCard(container: HTMLElement, task: TaskOccurrence): void {
     const project = this.plugin.store.getProject(task.projectId);
-    const card = container.createDiv({ cls: `pm-week-task ${task.completed ? "is-complete" : ""}` });
+    const card = container.createDiv({ cls: `pm-week-task ${task.completed ? "is-complete" : ""} ${task.kind === "composite" ? "is-composite" : ""}` });
     if (project?.color) {
       card.style.borderLeftColor = project.color;
     }
 
     const top = card.createDiv({ cls: "pm-week-task-top" });
-    const checkbox = top.createEl("input", { type: "checkbox" });
-    checkbox.checked = task.completed;
-    checkbox.addEventListener("change", async () => {
-      try {
-        await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
-      } catch (error) {
-        checkbox.checked = !checkbox.checked;
-        new Notice(error instanceof Error ? error.message : "更新失败");
-      }
-    });
-    top.createSpan({ text: task.title, cls: "pm-task-title" });
-    top.createSpan({ text: recurrenceLabel(task.recurrence), cls: "pm-tag" });
+    if (task.kind === "simple") {
+      const checkbox = top.createEl("input", { type: "checkbox" });
+      checkbox.checked = task.completed;
+      checkbox.addEventListener("change", async () => {
+        try {
+          await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
+        } catch (error) {
+          checkbox.checked = !checkbox.checked;
+          new Notice(error instanceof Error ? error.message : "更新失败");
+        }
+      });
+    }
+    const titleLine = top.createDiv({ cls: "pm-week-task-title-line" });
+    titleLine.createSpan({ text: task.title, cls: "pm-task-title" });
+    titleLine.createSpan({ text: recurrenceLabel(task.recurrence), cls: "pm-tag pm-week-recurrence-tag" });
+    const editButton = top.createEl("button", { text: "✎", cls: "pm-week-task-edit" });
+    editButton.setAttribute("aria-label", "编辑任务");
+    editButton.title = "编辑任务";
+    editButton.addEventListener("click", () => this.openEditOccurrenceModal(task));
 
     const meta = card.createDiv({ cls: "pm-task-meta" });
     meta.createSpan({ text: task.startTime && task.endTime ? `${task.startTime} - ${task.endTime}` : "未排期" });
@@ -282,9 +327,28 @@ export class OverviewView extends BaseProjectView {
     if (task.recurrence !== "once") {
       meta.createSpan({ text: `第 ${task.occurrenceNumber} 次` });
     }
+    if (task.kind === "composite") {
+      meta.createSpan({ text: `${task.completedSteps}/${task.totalSteps} 子任务` });
+      this.renderCompositeSubtasks(card, task);
+    }
+  }
 
-    const actions = card.createDiv({ cls: "pm-task-actions" });
-    actions.createEl("button", { text: "编辑" }).addEventListener("click", () => this.openEditOccurrenceModal(task));
+  private renderCompositeSubtasks(container: HTMLElement, task: TaskOccurrence): void {
+    const grid = container.createDiv({ cls: "pm-subtask-grid" });
+    task.subtasks.forEach((subtask) => {
+      const item = grid.createEl("button", {
+        text: subtask.title,
+        cls: `pm-subtask-chip ${task.completedSubtaskIds.includes(subtask.id) ? "is-complete" : ""}`
+      });
+      item.addEventListener("click", async () => {
+        const completed = !task.completedSubtaskIds.includes(subtask.id);
+        try {
+          await this.plugin.store.updateTaskOccurrenceSubtaskCompletion(task.taskId, task.date, subtask.id, completed);
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : "更新失败");
+        }
+      });
+    });
   }
 
   private renderProjectsTab(container: HTMLElement, pages: ProgressPage[], projects: Project[], allTasks: Task[]): void {
@@ -430,7 +494,9 @@ export class OverviewView extends BaseProjectView {
         recurrence: task.recurrence,
         recurrenceCount: task.recurrenceCount ?? null,
         recurrenceUntil: task.recurrenceUntil ?? null,
-        completed: task.occurrenceDates.length > 0 && task.completedOccurrences.length === task.occurrenceDates.length
+        kind: task.kind,
+        subtasks: task.subtasks,
+        completed: isTaskSeriesCompleted(task)
       },
       onSubmit: async (input) => {
         await this.plugin.store.updateTask(task.id, input, "series");
@@ -440,7 +506,8 @@ export class OverviewView extends BaseProjectView {
       },
       onCompleteSeries: async () => {
         await this.plugin.store.completeTaskSeries(task.id);
-      }
+      },
+      allowSingleDelete: false
     }).open();
   }
 
@@ -464,7 +531,9 @@ export class OverviewView extends BaseProjectView {
         recurrence: seriesTask.recurrence,
         recurrenceCount: seriesTask.recurrenceCount ?? null,
         recurrenceUntil: seriesTask.recurrenceUntil ?? null,
-        completed: seriesTask.occurrenceDates.length > 0 && seriesTask.completedOccurrences.length === seriesTask.occurrenceDates.length
+        kind: seriesTask.kind,
+        subtasks: seriesTask.subtasks,
+        completed: isTaskSeriesCompleted(seriesTask)
       },
       onSubmit: async (input) => {
         await this.plugin.store.updateTask(seriesTask.id, input, "series");
@@ -478,7 +547,8 @@ export class OverviewView extends BaseProjectView {
       },
       onCompleteSeries: async () => {
         await this.plugin.store.completeTaskSeries(seriesTask.id, task.date);
-      }
+      },
+      allowSingleDelete: true
     }).open();
   }
 }
@@ -510,6 +580,12 @@ function buildMonthLabels(weeks: Date[][]): Array<{ label: string; column: numbe
     }
   }
   return labels;
+}
+
+function buildYAxisValues(max: number): number[] {
+  const steps = 4;
+  const interval = Math.max(1, Math.ceil(max / steps));
+  return Array.from({ length: steps + 1 }, (_, index) => interval * (steps - index));
 }
 
 function heatLevel(count: number): number {
@@ -573,9 +649,18 @@ function compareSeriesTasks(a: Task, b: Task): number {
 }
 
 function toChartPoint(index: number, value: number, max: number): string {
-  const x = 20 + index * (860 / 29);
-  const y = 210 - (value / max) * 170;
+  const { x, y } = toChartCoordinates(index, value, max);
   return `${x},${y}`;
+}
+
+function toChartCoordinates(index: number, value: number, max: number): { x: number; y: number } {
+  const x = 20 + index * (860 / 29);
+  const y = valueToChartY(value, max);
+  return { x, y };
+}
+
+function valueToChartY(value: number, max: number): number {
+  return 210 - (value / max) * 170;
 }
 
 function scheduleSummary(task: Task): string {
@@ -586,5 +671,26 @@ function scheduleSummary(task: Task): string {
 }
 
 function completionSummary(task: Task): string {
-  return `${task.completedOccurrences.length}/${task.occurrenceDates.length}`;
+  const totalSteps = task.kind === "composite" ? task.occurrenceDates.length * task.subtasks.length : task.occurrenceDates.length;
+  const completedSteps =
+    task.kind === "composite"
+      ? task.occurrenceStates.reduce((sum, state) => sum + (state.completedSubtaskIds?.length ?? 0), 0)
+      : task.occurrenceStates.length;
+  const ratio = totalSteps === 0 ? 0 : Math.round((completedSteps / totalSteps) * 100);
+  const label = task.kind === "composite" ? "子任务" : "次";
+  return `${completedSteps}/${totalSteps} ${label} · ${ratio}%`;
+}
+
+function isTaskSeriesCompleted(task: Task): boolean {
+  if (task.occurrenceDates.length === 0) {
+    return false;
+  }
+  return task.occurrenceDates.every((date) => {
+    const state = task.occurrenceStates.find((item) => item.date === date);
+    if (task.kind === "simple") {
+      return Boolean(state);
+    }
+    const completedIds = new Set(state?.completedSubtaskIds ?? []);
+    return task.subtasks.every((subtask) => completedIds.has(subtask.id));
+  });
 }

@@ -1,7 +1,7 @@
 import { Notice, WorkspaceLeaf } from "obsidian";
 import { TaskModal } from "../components/taskModal";
 import type ProjectManagementPlugin from "../main";
-import { TaskOccurrence } from "../types";
+import { Task, TaskOccurrence } from "../types";
 import { now, toDateKey } from "../utils/date";
 import { BaseProjectView } from "./base";
 
@@ -33,6 +33,9 @@ export class TodayTasksView extends BaseProjectView {
     const tasks = this.plugin.store.getTasksForDate(today);
     const projects = this.plugin.store.getProjects();
     const visibleTasks = this.plugin.settings.showCompletedTasks ? tasks : tasks.filter((task) => !task.completed);
+    const totalSteps = tasks.reduce((sum, task) => sum + task.totalSteps, 0);
+    const completedSteps = tasks.reduce((sum, task) => sum + task.completedSteps, 0);
+    const progress = totalSteps === 0 ? 0 : Math.round((completedSteps / totalSteps) * 100);
 
     const header = container.createDiv({ cls: "pm-page-header" });
     const title = header.createDiv();
@@ -58,6 +61,18 @@ export class TodayTasksView extends BaseProjectView {
       }).open();
     });
 
+    const progressSection = container.createDiv({ cls: "pm-section" });
+    progressSection.createEl("h3", { text: "今日进度" });
+    if (tasks.length === 0) {
+      progressSection.createDiv({ cls: "pm-empty", text: "今天还没有任务，先新增一条开始吧。" });
+    } else {
+      progressSection.createDiv({ cls: "pm-muted", text: `${completedSteps} / ${totalSteps} 步 · ${progress}%` });
+      progressSection.createDiv({ cls: "pm-progress-bar" }).createDiv({
+        cls: "pm-progress-bar-fill",
+        attr: { style: `width: ${progress}%` }
+      });
+    }
+
     const incomplete = visibleTasks.filter((task) => !task.completed);
     const complete = visibleTasks.filter((task) => task.completed);
     this.renderTaskSection(container, "未完成", incomplete);
@@ -75,19 +90,20 @@ export class TodayTasksView extends BaseProjectView {
 
     const list = section.createDiv({ cls: "pm-task-list" });
     tasks.forEach((task) => {
-      const row = list.createDiv({ cls: "pm-task-row" });
+      const row = list.createDiv({ cls: `pm-task-row ${task.kind === "composite" ? "is-composite" : ""}` });
       const left = row.createDiv({ cls: "pm-task-main" });
-
-      const checkbox = left.createEl("input", { type: "checkbox" });
-      checkbox.checked = task.completed;
-      checkbox.addEventListener("change", async () => {
-        try {
-          await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
-        } catch (error) {
-          checkbox.checked = !checkbox.checked;
-          new Notice(error instanceof Error ? error.message : "更新失败");
-        }
-      });
+      if (task.kind === "simple") {
+        const checkbox = left.createEl("input", { type: "checkbox" });
+        checkbox.checked = task.completed;
+        checkbox.addEventListener("change", async () => {
+          try {
+            await this.plugin.store.updateTaskOccurrenceCompletion(task.taskId, task.date, checkbox.checked);
+          } catch (error) {
+            checkbox.checked = !checkbox.checked;
+            new Notice(error instanceof Error ? error.message : "更新失败");
+          }
+        });
+      }
 
       const info = left.createDiv({ cls: "pm-task-copy" });
       info.createEl("div", { text: task.title, cls: `pm-task-title ${task.completed ? "is-complete" : ""}` });
@@ -96,6 +112,10 @@ export class TodayTasksView extends BaseProjectView {
       meta.createSpan({ text: recurrenceLabel(task) });
       const project = this.plugin.store.getProject(task.projectId);
       meta.createSpan({ text: project?.name ?? "未归属项目" });
+      if (task.kind === "composite") {
+        meta.createSpan({ text: `${task.completedSteps}/${task.totalSteps} 子任务` });
+      }
+      this.renderSubtasks(info, task);
 
       const actions = row.createDiv({ cls: "pm-task-actions" });
       actions.createEl("button", { text: "编辑" }).addEventListener("click", () => this.openEditor(task));
@@ -130,7 +150,9 @@ export class TodayTasksView extends BaseProjectView {
         recurrence: seriesTask.recurrence,
         recurrenceCount: seriesTask.recurrenceCount ?? null,
         recurrenceUntil: seriesTask.recurrenceUntil ?? null,
-        completed: seriesTask.occurrenceDates.length > 0 && seriesTask.completedOccurrences.length === seriesTask.occurrenceDates.length
+        kind: seriesTask.kind,
+        subtasks: seriesTask.subtasks,
+        completed: isTaskSeriesCompleted(seriesTask)
       },
       onSubmit: async (input) => {
         await this.plugin.store.updateTask(seriesTask.id, input, "series");
@@ -144,8 +166,30 @@ export class TodayTasksView extends BaseProjectView {
       },
       onCompleteSeries: async () => {
         await this.plugin.store.completeTaskSeries(seriesTask.id, task.date);
-      }
+      },
+      allowSingleDelete: true
     }).open();
+  }
+
+  private renderSubtasks(container: HTMLElement, task: TaskOccurrence): void {
+    if (task.kind !== "composite") {
+      return;
+    }
+    const grid = container.createDiv({ cls: "pm-subtask-grid" });
+    task.subtasks.forEach((subtask) => {
+      const item = grid.createEl("button", {
+        text: subtask.title,
+        cls: `pm-subtask-chip ${task.completedSubtaskIds.includes(subtask.id) ? "is-complete" : ""}`
+      });
+      item.addEventListener("click", async () => {
+        const completed = !task.completedSubtaskIds.includes(subtask.id);
+        try {
+          await this.plugin.store.updateTaskOccurrenceSubtaskCompletion(task.taskId, task.date, subtask.id, completed);
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : "更新失败");
+        }
+      });
+    });
   }
 }
 
@@ -157,4 +201,19 @@ function recurrenceLabel(task: TaskOccurrence): string {
     return "每周此时重复";
   }
   return "单次任务";
+}
+
+function isTaskSeriesCompleted(task: Task): boolean {
+  if (task.occurrenceDates.length === 0) {
+    return false;
+  }
+  const allSubtaskIds = new Set(task.subtasks.map((item) => item.id));
+  return task.occurrenceDates.every((date) => {
+    const state = task.occurrenceStates.find((item) => item.date === date);
+    if (task.kind === "simple") {
+      return Boolean(state);
+    }
+    const completedIds = new Set(state?.completedSubtaskIds ?? []);
+    return task.subtasks.every((subtask) => completedIds.has(subtask.id)) && completedIds.size === allSubtaskIds.size;
+  });
 }

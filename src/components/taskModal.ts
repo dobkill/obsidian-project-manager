@@ -1,5 +1,5 @@
 import { App, ButtonComponent, Modal, Notice, Setting } from "obsidian";
-import { Project, Task, TaskDeleteScope, TaskInput, TaskOccurrence, TaskRecurrence, TaskUpdateScope } from "../types";
+import { Project, Task, TaskDeleteScope, TaskInput, TaskKind, TaskOccurrence, TaskRecurrence, TaskSubtaskInput, TaskUpdateScope } from "../types";
 
 type TaskModalOptions = {
   title: string;
@@ -7,6 +7,7 @@ type TaskModalOptions = {
   initial: TaskInput;
   existingTask?: Task;
   occurrenceContext?: TaskOccurrence;
+  allowSingleDelete?: boolean;
   onSubmit: (input: TaskInput, scope: TaskUpdateScope) => Promise<void>;
   onDelete?: (scope: TaskDeleteScope) => Promise<void>;
   onCompleteSeries?: () => Promise<void>;
@@ -27,6 +28,8 @@ export class TaskModal extends Modal {
     contentEl.createEl("h2", { text: this.options.title });
 
     const state: TaskInput = { ...this.options.initial };
+    state.kind = state.kind ?? "simple";
+    state.subtasks = [...(state.subtasks ?? [])];
     const saveScope: TaskUpdateScope = "series";
 
     if (this.options.existingTask?.occurrenceDates.length && this.options.existingTask.occurrenceDates.length > 1) {
@@ -48,6 +51,23 @@ export class TaskModal extends Modal {
             state.title = value;
           })
       );
+
+    new Setting(contentEl)
+      .setName("任务类型")
+      .setDesc("普通任务直接勾选完成；组合任务可拆成多个子任务分别完成")
+      .addDropdown((dropdown) => {
+        const labels: Record<TaskKind, string> = {
+          simple: "普通任务",
+          composite: "组合任务"
+        };
+        (Object.keys(labels) as TaskKind[]).forEach((key) => dropdown.addOption(key, labels[key]));
+        dropdown.setValue(state.kind ?? "simple");
+        dropdown.onChange((value) => {
+          state.kind = value as TaskKind;
+          state.subtasks = state.kind === "composite" ? state.subtasks ?? [{ title: "" }] : [];
+          renderSubtaskFields();
+        });
+      });
 
     new Setting(contentEl)
       .setName("描述")
@@ -109,33 +129,76 @@ export class TaskModal extends Modal {
             state.recurrenceCount = null;
             state.recurrenceUntil = null;
           }
+          renderRecurrenceFields();
         });
       });
 
-    new Setting(contentEl)
-      .setName("重复次数")
-      .setDesc("重复任务至少填写次数或结束日期之一")
-      .addText((text) =>
-        text.setPlaceholder("例如 10").setValue(state.recurrenceCount ? String(state.recurrenceCount) : "").onChange((value) => {
-          state.recurrenceCount = value.trim() ? Number(value) : null;
-        })
-      );
+    const recurrenceFields = contentEl.createDiv();
+    const subtaskFields = contentEl.createDiv();
+    const renderRecurrenceFields = (): void => {
+      recurrenceFields.empty();
+      if (state.recurrence === "once") {
+        return;
+      }
+      new Setting(recurrenceFields)
+        .setName("重复次数")
+        .setDesc("重复任务至少填写次数或结束日期之一")
+        .addText((text) =>
+          text.setPlaceholder("例如 10").setValue(state.recurrenceCount ? String(state.recurrenceCount) : "").onChange((value) => {
+            state.recurrenceCount = value.trim() ? Number(value) : null;
+          })
+        );
 
-    new Setting(contentEl)
-      .setName("重复结束日期")
-      .addText((text) =>
-        text.setPlaceholder("YYYY-MM-DD").setValue(state.recurrenceUntil ?? "").onChange((value) => {
-          state.recurrenceUntil = value.trim() || null;
-        })
-      );
+      new Setting(recurrenceFields)
+        .setName("重复结束日期")
+        .addText((text) =>
+          text.setPlaceholder("YYYY-MM-DD").setValue(state.recurrenceUntil ?? "").onChange((value) => {
+            state.recurrenceUntil = value.trim() || null;
+          })
+        );
+    };
+    renderRecurrenceFields();
 
-    new Setting(contentEl)
-      .setName("完成状态")
-      .addToggle((toggle) =>
-        toggle.setValue(Boolean(state.completed)).onChange((value) => {
-          state.completed = value;
-        })
-      );
+    const renderSubtaskFields = (): void => {
+      subtaskFields.empty();
+      if (state.kind !== "composite") {
+        return;
+      }
+
+      subtaskFields.addClass("pm-subtask-editor");
+      subtaskFields.createDiv({ cls: "pm-muted", text: "组合任务会在周任务图和今日任务中渲染为一个大框，内部子任务可单独勾选完成。" });
+
+      const list = subtaskFields.createDiv({ cls: "pm-subtask-editor-list" });
+      const subtasks = state.subtasks ?? [];
+      subtasks.forEach((subtask, index) => {
+        const row = list.createDiv({ cls: "pm-subtask-editor-row" });
+        row.createSpan({ cls: "pm-subtask-editor-index", text: `${index + 1}.` });
+        const input = row.createEl("input", {
+          type: "text",
+          placeholder: `子任务 ${index + 1}`
+        });
+        input.value = subtask.title;
+        input.addEventListener("input", () => {
+          subtasks[index] = {
+            ...subtasks[index],
+            title: input.value
+          };
+          state.subtasks = [...subtasks];
+        });
+        row.createEl("button", { text: "删除", cls: "mod-warning" }).addEventListener("click", () => {
+          subtasks.splice(index, 1);
+          state.subtasks = [...subtasks];
+          renderSubtaskFields();
+        });
+      });
+
+      const actions = subtaskFields.createDiv({ cls: "pm-inline-actions" });
+      actions.createEl("button", { text: "新增子任务" }).addEventListener("click", () => {
+        state.subtasks = [...(state.subtasks ?? []), { title: "" } satisfies TaskSubtaskInput];
+        renderSubtaskFields();
+      });
+    };
+    renderSubtaskFields();
 
     const footer = contentEl.createDiv({ cls: "pm-modal-actions" });
     new ButtonComponent(footer)
@@ -151,17 +214,19 @@ export class TaskModal extends Modal {
       });
 
     if (this.options.onDelete) {
-      new ButtonComponent(footer)
-        .setButtonText("删除本次")
-        .setWarning()
-        .onClick(async () => {
-          await this.options.onDelete?.("single");
-          this.close();
-        });
+      if (this.options.allowSingleDelete) {
+        new ButtonComponent(footer)
+          .setButtonText("删除本次实例")
+          .setWarning()
+          .onClick(async () => {
+            await this.options.onDelete?.("single");
+            this.close();
+          });
+      }
 
       if (this.options.existingTask?.occurrenceDates.length && this.options.existingTask.occurrenceDates.length > 1) {
         new ButtonComponent(footer)
-          .setButtonText(this.options.occurrenceContext ? "删除整个任务" : "删除整个任务")
+          .setButtonText("删除整个系列")
           .setWarning()
           .onClick(async () => {
             await this.options.onDelete?.("series");

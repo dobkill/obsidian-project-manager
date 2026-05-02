@@ -10,8 +10,12 @@ import {
   Task,
   TaskDeleteScope,
   TaskInput,
+  TaskKind,
   TaskOccurrence,
+  TaskOccurrenceState,
   TaskRecurrence,
+  TaskSubtask,
+  TaskSubtaskInput,
   TaskUpdateScope,
   TasksFile
 } from "../types";
@@ -42,6 +46,7 @@ export class ProjectManagementStore extends Events {
   private progressPages: ProgressPage[] = [];
   private tasks = new Map<string, Task[]>();
   private writeQueue: Promise<void> = Promise.resolve();
+  private readOnlyReason: string | null = null;
 
   constructor(app: App, config: PluginConfig) {
     super();
@@ -64,9 +69,45 @@ export class ProjectManagementStore extends Events {
   }
 
   async setConfig(next: PluginConfig): Promise<void> {
-    this.config = structuredClone(next);
-    await this.ensureDataFolder();
-    await this.enqueueWrite(() => this.writeJson(this.pathFor(CONFIG_FILE), this.config));
+    this.assertWritable();
+    const previousFolder = sanitizeFolder(this.config.dataFolder);
+    const nextFolder = sanitizeFolder(next.dataFolder);
+    const nextConfig = { ...next, dataFolder: nextFolder };
+    if (previousFolder !== nextFolder) {
+      await this.flushPendingWrites();
+      const currentData = this.captureDataState();
+      const usage = await this.inspectDataFolder(nextFolder);
+      this.config = structuredClone(nextConfig);
+      await this.ensureDataFolder();
+      if (usage.hasData && usage.invalidPaths.length === 0) {
+        const failedPaths = await this.loadCurrentFolderData();
+        if (failedPaths.length === 0) {
+          await this.flushAll();
+          await this.reloadCurrentFolderData();
+          new Notice(`数据目录已切换到 ${nextFolder}，已使用目标目录中的现有数据`);
+        } else {
+          this.restoreDataState(currentData);
+          this.config = structuredClone(nextConfig);
+          await this.flushAll();
+          await this.reloadCurrentFolderData();
+          new Notice(`目标目录数据格式异常，已用当前数据重新创建：${failedPaths.join("、")}`, 0);
+        }
+      } else {
+        this.restoreDataState(currentData);
+        await this.flushAll();
+        await this.reloadCurrentFolderData();
+        if (usage.invalidPaths.length > 0) {
+          new Notice(`目标目录数据格式异常，已用当前数据重新创建：${usage.invalidPaths.join("、")}`, 0);
+        } else {
+          new Notice(`数据目录已切换到 ${nextFolder}，已创建新的数据文件`);
+        }
+      }
+    } else {
+      this.config = structuredClone(nextConfig);
+      await this.ensureDataFolder();
+      await this.enqueueWrite(() => this.writeJson(this.pathFor(CONFIG_FILE), this.config));
+      await this.reloadCurrentFolderData();
+    }
     this.trigger("changed");
   }
 
@@ -144,54 +185,95 @@ export class ProjectManagementStore extends Events {
   }
 
   async initialize(): Promise<void> {
-    this.config = await this.loadConfigFile();
+    const configResult = await this.loadConfigFile();
+    this.config = configResult.config;
     await this.ensureDataFolder();
-    await this.loadProjects();
-    await this.loadProgressPages();
-    await this.loadTasks();
+    const failedPaths = [...configResult.failedPaths, ...(await this.loadCurrentFolderData())].filter((path, index, list) => list.indexOf(path) === index);
+    if (failedPaths.length > 0) {
+      this.readOnlyReason = `检测到数据文件读取失败，已进入只读保护：${failedPaths.join("、")}`;
+      new Notice(this.readOnlyReason, 0);
+      console.error(this.readOnlyReason);
+      return;
+    }
+    this.readOnlyReason = null;
     await this.flushAll();
   }
 
+  async refreshFromDisk(options: { triggerChange?: boolean } = {}): Promise<void> {
+    const { triggerChange = true } = options;
+    const failedPaths = await this.loadCurrentFolderData();
+    if (failedPaths.length > 0) {
+      this.readOnlyReason = `检测到数据文件读取失败，已进入只读保护：${failedPaths.join("、")}`;
+      throw new Error(this.readOnlyReason);
+    }
+    this.readOnlyReason = null;
+    if (triggerChange) {
+      this.trigger("changed");
+    }
+  }
+
+  async flushPendingWrites(): Promise<void> {
+    await this.writeQueue;
+    if (!this.readOnlyReason) {
+      await this.flushAll();
+    }
+  }
+
   async validateDataFolder(path: string): Promise<{ ok: boolean; message?: string }> {
+    const raw = path.trim();
     const cleaned = sanitizeFolder(path);
     if (!cleaned) {
       return { ok: false, message: "数据目录不能为空" };
     }
-    if (cleaned.startsWith("/") || cleaned.includes("..")) {
+    if (raw.startsWith("/") || cleaned.includes("..")) {
       return { ok: false, message: "数据目录必须是 Vault 内相对路径" };
     }
     const normalized = normalizePath(cleaned);
     const abstract = this.app.vault.getAbstractFileByPath(normalized);
-    if (!abstract) {
+    const stat = abstract ? null : await this.app.vault.adapter.stat(normalized);
+    if (!abstract && !stat) {
       return { ok: true };
     }
-    if (!(abstract instanceof TFolder)) {
+    if (abstract && !(abstract instanceof TFolder)) {
       return { ok: false, message: "数据目录路径已被文件占用" };
     }
+    if (!abstract && stat?.type !== "folder") {
+      return { ok: false, message: "数据目录路径已被文件占用" };
+    }
+
+    const children = abstract instanceof TFolder ? abstract.children.map((child) => ({ name: child.name, isFolder: child instanceof TFolder })) : await this.listFolderEntries(normalized);
     const allowed = new Set([CONFIG_FILE, PROJECTS_FILE, PROGRESS_FILE, TASKS_DIR]);
-    const invalid = abstract.children.some((child: TAbstractFile) => !allowed.has(child.name));
+    const invalid = children.some((child) => !allowed.has(child.name));
     if (invalid) {
       return { ok: false, message: "目录中存在非插件文件，拒绝使用" };
+    }
+    const invalidTasksPath = children.some((child) => child.name === TASKS_DIR && !child.isFolder);
+    if (invalidTasksPath) {
+      return { ok: false, message: "tasks 路径已被文件占用" };
     }
     return { ok: true };
   }
 
   async createTask(input: TaskInput): Promise<Task> {
+    this.assertWritable();
     const normalized = this.normalizeTaskInput(input);
     const created = this.buildSeriesTask(normalized);
     this.assertNoConflicts([created], new Set());
     this.insertTask(created);
     await this.persistMonths(monthsForTasks([created]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
-    return cloneTask(created);
+    return cloneTask(this.findTask(created.id) ?? created);
   }
 
   async updateTask(taskId: string, patch: Partial<TaskInput> & { completed?: boolean }, _scope: TaskUpdateScope = "series"): Promise<Task> {
+    this.assertWritable();
     const original = this.findTask(taskId);
     if (!original) {
       throw new Error("任务不存在");
     }
     const merged = this.normalizeTaskInput({
+      kind: patch.kind ?? original.kind,
       title: patch.title ?? original.title,
       description: patch.description ?? original.description,
       projectId: patch.projectId === undefined ? original.projectId : patch.projectId,
@@ -201,6 +283,7 @@ export class ProjectManagementStore extends Events {
       recurrence: patch.recurrence ?? original.recurrence,
       recurrenceCount: patch.recurrenceCount ?? original.recurrenceCount ?? undefined,
       recurrenceUntil: patch.recurrenceUntil ?? original.recurrenceUntil ?? undefined,
+      subtasks: patch.subtasks ?? original.subtasks,
       completed: patch.completed ?? isTaskFullyCompleted(original)
     });
 
@@ -208,11 +291,13 @@ export class ProjectManagementStore extends Events {
     this.assertNoConflicts([next], occurrenceKeysForTask(original));
     this.replaceTasks([original.id], [next]);
     await this.persistMonths(monthsForTasks([original, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
-    return cloneTask(next);
+    return cloneTask(this.findTask(next.id) ?? next);
   }
 
   async updateTaskOccurrenceCompletion(taskId: string, date: string, completed: boolean): Promise<void> {
+    this.assertWritable();
     const original = this.findTask(taskId);
     if (!original) {
       throw new Error("任务不存在");
@@ -221,16 +306,61 @@ export class ProjectManagementStore extends Events {
       throw new Error("任务发生日期不存在");
     }
     const next = cloneTask(original);
-    next.completedOccurrences = completed
-      ? upsertCompletionRecord(original.completedOccurrences, date, toIsoLocal(now()))
-      : original.completedOccurrences.filter((item) => item.date !== date);
+    next.occurrenceStates = completed
+      ? upsertOccurrenceState(original, date, {
+          completedSubtaskIds: getAllSubtaskIds(original),
+          completedAt: toIsoLocal(now())
+        })
+      : next.occurrenceStates.filter((item) => item.date !== date);
     next.updatedAt = toIsoLocal(now());
     this.replaceTasks([original.id], [next]);
     await this.persistMonths(monthsForTasks([original, next]));
+    await this.reloadCurrentFolderData();
+    this.trigger("changed");
+  }
+
+  async updateTaskOccurrenceSubtaskCompletion(taskId: string, date: string, subtaskId: string, completed: boolean): Promise<void> {
+    this.assertWritable();
+    const original = this.findTask(taskId);
+    if (!original) {
+      throw new Error("任务不存在");
+    }
+    if (original.kind !== "composite") {
+      throw new Error("当前任务不是组合任务");
+    }
+    if (!original.occurrenceDates.includes(date)) {
+      throw new Error("任务发生日期不存在");
+    }
+    if (!original.subtasks.some((item) => item.id === subtaskId)) {
+      throw new Error("子任务不存在");
+    }
+
+    const state = getOccurrenceState(original, date);
+    const completedSubtaskIds = new Set(state?.completedSubtaskIds ?? []);
+    if (completed) {
+      completedSubtaskIds.add(subtaskId);
+    } else {
+      completedSubtaskIds.delete(subtaskId);
+    }
+
+    const next = cloneTask(original);
+    const nextCompletedIds = original.subtasks.map((item) => item.id).filter((id) => completedSubtaskIds.has(id));
+    next.occurrenceStates =
+      nextCompletedIds.length === 0
+        ? next.occurrenceStates.filter((item) => item.date !== date)
+        : upsertOccurrenceState(original, date, {
+            completedSubtaskIds: nextCompletedIds,
+            completedAt: nextCompletedIds.length === original.subtasks.length ? toIsoLocal(now()) : null
+          });
+    next.updatedAt = toIsoLocal(now());
+    this.replaceTasks([original.id], [next]);
+    await this.persistMonths(monthsForTasks([original, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
 
   async deleteTask(taskId: string, scope: TaskDeleteScope = "series"): Promise<void> {
+    this.assertWritable();
     const task = this.findTask(taskId);
     if (!task) {
       return;
@@ -241,10 +371,12 @@ export class ProjectManagementStore extends Events {
     }
     const removed = this.replaceTasks([taskId], []);
     await this.persistMonths(monthsForTasks(removed));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
 
   async deleteTaskOccurrence(taskId: string, date: string): Promise<void> {
+    this.assertWritable();
     const task = this.findTask(taskId);
     if (!task) {
       return;
@@ -255,12 +387,13 @@ export class ProjectManagementStore extends Events {
     if (task.occurrenceDates.length === 1) {
       const removed = this.replaceTasks([task.id], []);
       await this.persistMonths(monthsForTasks(removed));
+      await this.reloadCurrentFolderData();
       this.trigger("changed");
       return;
     }
     const next = cloneTask(task);
     next.occurrenceDates = task.occurrenceDates.filter((entry) => entry !== date);
-    next.completedOccurrences = task.completedOccurrences.filter((entry) => entry.date !== date);
+    next.occurrenceStates = task.occurrenceStates.filter((entry) => entry.date !== date);
     next.date = next.occurrenceDates[0];
     next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
     next.recurrenceCount = next.recurrence === "once" ? null : next.occurrenceDates.length;
@@ -269,10 +402,12 @@ export class ProjectManagementStore extends Events {
     this.assertNoConflicts([next], occurrenceKeysForTask(task));
     this.replaceTasks([task.id], [next]);
     await this.persistMonths(monthsForTasks([task, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
 
   async completeTaskSeries(taskId: string, throughDate?: string): Promise<void> {
+    this.assertWritable();
     const task = this.findTask(taskId);
     if (!task) {
       return;
@@ -282,9 +417,13 @@ export class ProjectManagementStore extends Events {
     const remainingDates = task.occurrenceDates.filter((date) => compareDateKeys(date, effectiveDate) <= 0);
     const stamp = toIsoLocal(now());
     next.occurrenceDates = remainingDates;
-    next.completedOccurrences = remainingDates.reduce<Array<{ date: string; completedAt: string }>>((records, date) => {
-      const existing = task.completedOccurrences.find((item) => item.date === date);
-      records.push(existing ?? { date, completedAt: stamp });
+    next.occurrenceStates = remainingDates.reduce<TaskOccurrenceState[]>((records, date) => {
+      const existing = getOccurrenceState(task, date);
+      records.push(
+        existing
+          ? buildNormalizedOccurrenceState(date, task.kind, task.subtasks, existing.completedSubtaskIds ?? getAllSubtaskIds(task), stamp)
+          : buildNormalizedOccurrenceState(date, task.kind, task.subtasks, getAllSubtaskIds(task), stamp)
+      );
       return records;
     }, []);
     next.date = next.occurrenceDates[0];
@@ -294,10 +433,12 @@ export class ProjectManagementStore extends Events {
     next.updatedAt = stamp;
     this.replaceTasks([task.id], [next]);
     await this.persistMonths(monthsForTasks([task, next]));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
 
   async createProject(input: ProjectInput): Promise<Project> {
+    this.assertWritable();
     const timestamp = toIsoLocal(now());
     const project: Project = {
       id: crypto.randomUUID(),
@@ -322,11 +463,13 @@ export class ProjectManagementStore extends Events {
       await this.writeJson(this.pathFor(PROJECTS_FILE), { projects: this.projects } satisfies ProjectsFile);
       await this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages } satisfies ProgressPagesFile);
     });
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
     return { ...project };
   }
 
   async updateProject(projectId: string, patch: Partial<ProjectInput>): Promise<void> {
+    this.assertWritable();
     const project = this.projects.find((entry) => entry.id === projectId);
     if (!project) {
       throw new Error("项目不存在");
@@ -345,28 +488,32 @@ export class ProjectManagementStore extends Events {
       await this.writeJson(this.pathFor(PROJECTS_FILE), { projects: this.projects });
       await this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages });
     });
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
 
   async deleteProject(projectId: string): Promise<void> {
+    this.assertWritable();
     this.projects = this.projects.filter((project) => project.id !== projectId);
     this.progressPages = this.progressPages.filter((page) => page.projectId !== projectId);
-    const timestamp = toIsoLocal(now());
-    const tasks = this.getTasksForProject(projectId).map((task) => ({
-      ...task,
-      projectId: undefined,
-      updatedAt: timestamp
-    }));
-    this.replaceTasks(tasks.map((task) => task.id), tasks);
+    const removedTasks = this.replaceTasks(
+      this.getTasksForProject(projectId).map((task) => task.id),
+      []
+    );
+    const affectedMonths = [...new Set(monthsForTasks(removedTasks))];
     await this.enqueueWrite(async () => {
       await this.writeJson(this.pathFor(PROJECTS_FILE), { projects: this.projects });
       await this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages });
-      await this.flushAllTasks();
+      for (const month of affectedMonths) {
+        await this.flushMonth(month);
+      }
     });
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
 
   async reorderProgressPage(projectId: string, direction: -1 | 1): Promise<void> {
+    this.assertWritable();
     const index = this.progressPages.findIndex((page) => page.projectId === projectId);
     const target = index + direction;
     if (index < 0 || target < 0 || target >= this.progressPages.length) {
@@ -375,16 +522,16 @@ export class ProjectManagementStore extends Events {
     const [item] = this.progressPages.splice(index, 1);
     this.progressPages.splice(target, 0, item);
     await this.enqueueWrite(() => this.writeJson(this.pathFor(PROGRESS_FILE), { pages: this.progressPages }));
+    await this.reloadCurrentFolderData();
     this.trigger("changed");
   }
 
   getProjectProgress(projectId: string): number {
-    const tasks = this.getOccurrencesForProject(projectId);
-    if (tasks.length === 0) {
+    const progress = summarizeOccurrencesProgress(this.getOccurrencesForProject(projectId));
+    if (progress.totalSteps === 0) {
       return 0;
     }
-    const done = tasks.filter((task) => task.completed).length;
-    return Math.round((done / tasks.length) * 100);
+    return Math.round((progress.completedSteps / progress.totalSteps) * 100);
   }
 
   private normalizeTaskInput(input: TaskInput): TaskInput {
@@ -414,8 +561,10 @@ export class ProjectManagementStore extends Events {
     }
 
     const recurrence = input.recurrence ?? "once";
+    const kind = input.kind ?? "simple";
     const recurrenceCount = recurrence === "once" ? null : normalizePositiveInteger(input.recurrenceCount);
     const recurrenceUntil = recurrence === "once" ? null : normalizeDateOrUndefined(input.recurrenceUntil);
+    const subtasks = normalizeSubtaskInputs(input.subtasks, kind);
 
     if (recurrence !== "once" && !recurrenceCount && !recurrenceUntil) {
       throw new Error("重复任务必须填写重复次数或结束日期");
@@ -425,6 +574,7 @@ export class ProjectManagementStore extends Events {
     }
 
     return {
+      kind,
       title,
       description: input.description?.trim() || "",
       projectId: input.projectId || undefined,
@@ -434,6 +584,7 @@ export class ProjectManagementStore extends Events {
       recurrence,
       recurrenceCount,
       recurrenceUntil,
+      subtasks,
       completed: input.completed ?? false
     };
   }
@@ -441,15 +592,18 @@ export class ProjectManagementStore extends Events {
   private buildSeriesTask(input: TaskInput, original?: Task, completedPatch?: boolean): Task {
     const timestamp = toIsoLocal(now());
     const occurrenceDates = buildOccurrenceDates(input);
-    const completedOccurrences = resolveCompletedOccurrences({
+    const subtasks = resolveTaskSubtasks(input.subtasks, input.kind ?? "simple", original?.subtasks ?? []);
+    const occurrenceStates = resolveOccurrenceStates({
       input,
       original,
+      subtasks,
       occurrenceDates,
       timestamp,
       completedPatch
     });
     return {
       id: original?.id ?? crypto.randomUUID(),
+      kind: input.kind ?? "simple",
       title: input.title,
       description: input.description,
       projectId: input.projectId,
@@ -459,8 +613,9 @@ export class ProjectManagementStore extends Events {
       recurrence: input.recurrence,
       recurrenceCount: input.recurrenceCount ?? null,
       recurrenceUntil: input.recurrenceUntil ?? null,
+      subtasks,
       occurrenceDates,
-      completedOccurrences,
+      occurrenceStates,
       createdAt: original?.createdAt ?? timestamp,
       updatedAt: timestamp
     };
@@ -540,38 +695,67 @@ export class ProjectManagementStore extends Events {
     return undefined;
   }
 
-  private async loadConfigFile(): Promise<PluginConfig> {
+  private async loadConfigFile(): Promise<{ config: PluginConfig; failedPaths: string[] }> {
     const path = this.pathFor(CONFIG_FILE);
-    const existing = await this.readJson<PluginConfig>(path);
-    return { ...DEFAULT_CONFIG, ...existing };
+    const dataFolder = sanitizeFolder(this.config.dataFolder);
+    const existing = await this.readJson<Partial<PluginConfig>>(path, isPartialPluginConfig);
+    return {
+      config: { ...DEFAULT_CONFIG, ...this.config, ...(existing.value ?? {}), dataFolder },
+      failedPaths: existing.ok ? [] : [existing.path!]
+    };
   }
 
-  private async loadProjects(): Promise<void> {
-    const data = await this.readJson<ProjectsFile>(this.pathFor(PROJECTS_FILE));
-    this.projects = data?.projects ?? [];
+  private async loadProjects(): Promise<BatchReadResult> {
+    const data = await this.readJson<ProjectsFile>(this.pathFor(PROJECTS_FILE), isProjectsFile);
+    this.projects = data.value?.projects ?? [];
+    return { failedPaths: data.ok ? [] : [data.path!] };
   }
 
-  private async loadProgressPages(): Promise<void> {
-    const data = await this.readJson<ProgressPagesFile>(this.pathFor(PROGRESS_FILE));
-    this.progressPages = data?.pages ?? [];
+  private async loadProgressPages(): Promise<BatchReadResult> {
+    const data = await this.readJson<ProgressPagesFile>(this.pathFor(PROGRESS_FILE), isProgressPagesFile);
+    this.progressPages = data.value?.pages ?? [];
+    return { failedPaths: data.ok ? [] : [data.path!] };
   }
 
-  private async loadTasks(): Promise<void> {
+  private async loadTasks(): Promise<BatchReadResult> {
     const tasksFolder = this.pathFor(TASKS_DIR);
     const folder = this.app.vault.getAbstractFileByPath(tasksFolder);
-    if (!(folder instanceof TFolder)) {
+    const folderStat = folder ? null : await this.app.vault.adapter.stat(tasksFolder);
+    if ((folder && !(folder instanceof TFolder)) || (!folder && folderStat && folderStat.type !== "folder")) {
+      return { failedPaths: [tasksFolder] };
+    }
+    if (!folder && !folderStat) {
       this.tasks.clear();
-      return;
+      return { failedPaths: [] };
     }
     this.tasks.clear();
-    for (const child of folder.children) {
-      if (child instanceof TFolder || !child.name.endsWith(".json")) {
-        continue;
+    const failedPaths: string[] = [];
+    const monthFiles = await this.collectMonthFilePaths(tasksFolder);
+    for (const childPath of monthFiles) {
+      const data = await this.readJson<TasksFile>(childPath, isTasksFile);
+      const month = childPath.split("/").pop()?.replace(/\.json$/, "") ?? "";
+      if (!data.ok) {
+        failedPaths.push(childPath);
       }
-      const data = await this.readJson<TasksFile>(child.path);
-      const month = child.name.replace(/\.json$/, "");
-      this.tasks.set(month, (data?.tasks ?? []).map(cloneTask));
+      this.tasks.set(month, (data.value?.tasks ?? []).map(normalizeStoredTask));
     }
+    return { failedPaths };
+  }
+
+  private async loadCurrentFolderData(): Promise<string[]> {
+    const configResult = await this.loadConfigFile();
+    this.config = configResult.config;
+    await this.ensureDataFolder();
+    const projectResult = await this.loadProjects();
+    const progressResult = await this.loadProgressPages();
+    const taskResult = await this.loadTasks();
+    return [...configResult.failedPaths, ...projectResult.failedPaths, ...progressResult.failedPaths, ...taskResult.failedPaths].filter(
+      (path, index, list) => list.indexOf(path) === index
+    );
+  }
+
+  private async reloadCurrentFolderData(): Promise<void> {
+    await this.refreshFromDisk({ triggerChange: false });
   }
 
   private async ensureDataFolder(): Promise<void> {
@@ -584,28 +768,59 @@ export class ProjectManagementStore extends Events {
   }
 
   private pathFor(child: string): string {
-    return normalizePath(`${sanitizeFolder(this.config.dataFolder)}/${child}`);
+    return this.pathInFolder(this.config.dataFolder, child);
+  }
+
+  private pathInFolder(folder: string, child: string): string {
+    return normalizePath(`${sanitizeFolder(folder)}/${child}`);
   }
 
   private async ensureFolder(path: string): Promise<void> {
     const normalized = normalizePath(path);
-    if (!this.app.vault.getAbstractFileByPath(normalized)) {
+    const existing = this.app.vault.getAbstractFileByPath(normalized);
+    if (existing instanceof TFolder) {
+      return;
+    }
+    if (existing) {
+      throw new Error(`${normalized} 已被文件占用`);
+    }
+    const existingStat = await this.app.vault.adapter.stat(normalized);
+    if (existingStat?.type === "folder") {
+      return;
+    }
+    if (existingStat?.type === "file") {
+      throw new Error(`${normalized} 已被文件占用`);
+    }
+    try {
       await this.app.vault.createFolder(normalized);
+    } catch (error) {
+      const current = this.app.vault.getAbstractFileByPath(normalized);
+      const currentStat = current ? null : await this.app.vault.adapter.stat(normalized);
+      if ((current instanceof TFolder || currentStat?.type === "folder") && isFolderAlreadyExistsError(error)) {
+        return;
+      }
+      throw error;
     }
   }
 
-  private async readJson<T>(path: string): Promise<T | null> {
+  private async readJson<T>(path: string, validate?: (value: unknown) => value is T, notifyOnError = true): Promise<ReadResult<T>> {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!file) {
-      return null;
-    }
     try {
-      const raw = await this.app.vault.cachedRead(file as any);
-      return JSON.parse(raw) as T;
+      const raw = file ? await this.app.vault.cachedRead(file as any) : await this.readTextFromAdapter(path);
+      if (raw === null) {
+        return { ok: true, value: null };
+      }
+      const parsed = JSON.parse(raw) as unknown;
+      if (validate && !validate(parsed)) {
+        throw new Error("数据结构不符合当前插件格式");
+      }
+      return { ok: true, value: parsed as T };
     } catch (error) {
       console.error("Failed to read JSON file", path, error);
-      new Notice(`读取数据失败: ${path}`);
-      return null;
+      if (notifyOnError) {
+        new Notice(`读取数据失败，已停止自动写回: ${path}`, 0);
+      }
+      return { ok: false, value: null, path };
     }
   }
 
@@ -614,15 +829,18 @@ export class ProjectManagementStore extends Events {
     const payload = JSON.stringify(data, null, 2);
     const file = this.app.vault.getAbstractFileByPath(normalized);
     if (!file) {
-      await this.app.vault.create(normalized, payload);
+      await this.app.vault.adapter.write(normalized, payload);
       return;
     }
     await this.app.vault.modify(file as any, payload);
   }
 
   private async enqueueWrite(job: () => Promise<void>): Promise<void> {
-    this.writeQueue = this.writeQueue.then(job);
-    return this.writeQueue;
+    const run = this.writeQueue.catch(() => undefined).then(job);
+    this.writeQueue = run.catch((error) => {
+      console.error("Project management data write failed", error);
+    });
+    return run;
   }
 
   private async persistMonths(months: string[]): Promise<void> {
@@ -650,7 +868,7 @@ export class ProjectManagementStore extends Events {
   private async flushAllTasks(): Promise<void> {
     const months = new Set<string>([
       ...this.tasks.keys(),
-      ...collectMonthFiles(this.app, this.pathFor(TASKS_DIR))
+      ...(await this.collectMonthFiles(this.pathFor(TASKS_DIR)))
     ]);
     for (const month of months) {
       await this.flushMonth(month);
@@ -665,24 +883,237 @@ export class ProjectManagementStore extends Events {
       await this.flushAllTasks();
     });
   }
+
+  private assertWritable(): void {
+    if (this.readOnlyReason) {
+      throw new Error(this.readOnlyReason);
+    }
+  }
+
+  private captureDataState(): StoreDataState {
+    return {
+      projects: this.projects.map((project) => ({ ...project })),
+      progressPages: this.progressPages.map((page) => ({ ...page, columnOrder: [...page.columnOrder] })),
+      tasks: new Map([...this.tasks.entries()].map(([month, tasks]) => [month, tasks.map(cloneTask)]))
+    };
+  }
+
+  private restoreDataState(state: StoreDataState): void {
+    this.projects = state.projects.map((project) => ({ ...project }));
+    this.progressPages = state.progressPages.map((page) => ({ ...page, columnOrder: [...page.columnOrder] }));
+    this.tasks = new Map([...state.tasks.entries()].map(([month, tasks]) => [month, tasks.map(cloneTask)]));
+  }
+
+  private async inspectDataFolder(folder: string): Promise<DataFolderUsage> {
+    const normalized = normalizePath(sanitizeFolder(folder));
+    const abstract = this.app.vault.getAbstractFileByPath(normalized);
+    const stat = abstract ? null : await this.app.vault.adapter.stat(normalized);
+    if ((abstract && !(abstract instanceof TFolder)) || (!abstract && stat && stat.type !== "folder")) {
+      return { hasData: true, invalidPaths: [normalized] };
+    }
+    if (!abstract && !stat) {
+      return { hasData: false, invalidPaths: [] };
+    }
+
+    const invalidPaths: string[] = [];
+    let hasData = false;
+    const check = async <T>(path: string, validate: (value: unknown) => value is T): Promise<void> => {
+      const current = this.app.vault.getAbstractFileByPath(path);
+      const currentStat = current ? null : await this.app.vault.adapter.stat(path);
+      if (current && current instanceof TFolder) {
+        hasData = true;
+        invalidPaths.push(path);
+        return;
+      }
+      if (!current && !currentStat) {
+        return;
+      }
+      hasData = true;
+      const result = await this.readJson<T>(path, validate, false);
+      if (!result.ok) {
+        invalidPaths.push(path);
+      }
+    };
+
+    await check<Partial<PluginConfig>>(this.pathInFolder(folder, CONFIG_FILE), isPartialPluginConfig);
+    await check<ProjectsFile>(this.pathInFolder(folder, PROJECTS_FILE), isProjectsFile);
+    await check<ProgressPagesFile>(this.pathInFolder(folder, PROGRESS_FILE), isProgressPagesFile);
+
+    const tasksPath = this.pathInFolder(folder, TASKS_DIR);
+    const tasksFolder = this.app.vault.getAbstractFileByPath(tasksPath);
+    const tasksStat = tasksFolder ? null : await this.app.vault.adapter.stat(tasksPath);
+    if ((tasksFolder && !(tasksFolder instanceof TFolder)) || (!tasksFolder && tasksStat && tasksStat.type !== "folder")) {
+      hasData = true;
+      invalidPaths.push(tasksPath);
+    } else {
+      const monthFiles = await this.collectMonthFilePaths(tasksPath);
+      for (const childPath of monthFiles) {
+        hasData = true;
+        const result = await this.readJson<TasksFile>(childPath, isTasksFile, false);
+        if (!result.ok) {
+          invalidPaths.push(childPath);
+        }
+      }
+    }
+
+    return { hasData, invalidPaths };
+  }
+
+  private async readTextFromAdapter(path: string): Promise<string | null> {
+    const normalized = normalizePath(path);
+    const stat = await this.app.vault.adapter.stat(normalized);
+    if (!stat) {
+      return null;
+    }
+    if (stat.type !== "file") {
+      throw new Error(`${normalized} 不是文件`);
+    }
+    return this.app.vault.adapter.read(normalized);
+  }
+
+  private async listFolderEntries(path: string): Promise<Array<{ name: string; isFolder: boolean }>> {
+    try {
+      const listed = await this.app.vault.adapter.list(normalizePath(path));
+      return [
+        ...listed.folders.map((folder) => ({ name: folder.split("/").pop() ?? folder, isFolder: true })),
+        ...listed.files.map((file) => ({ name: file.split("/").pop() ?? file, isFolder: false }))
+      ];
+    } catch {
+      return [];
+    }
+  }
+
+  private async collectMonthFilePaths(tasksFolder: string): Promise<string[]> {
+    const folder = this.app.vault.getAbstractFileByPath(tasksFolder);
+    if (folder instanceof TFolder) {
+      return folder.children
+        .filter((child) => !(child instanceof TFolder) && child.name.endsWith(".json"))
+        .map((child) => child.path);
+    }
+    const entries = await this.listFolderEntries(tasksFolder);
+    return entries
+      .filter((child) => !child.isFolder && child.name.endsWith(".json"))
+      .map((child) => normalizePath(`${tasksFolder}/${child.name}`));
+  }
+
+  private async collectMonthFiles(tasksFolder: string): Promise<string[]> {
+    const paths = await this.collectMonthFilePaths(tasksFolder);
+    return paths.map((path) => path.split("/").pop()?.replace(/\.json$/, "") ?? "").filter(Boolean);
+  }
+}
+
+type ReadResult<T> = {
+  ok: boolean;
+  value: T | null;
+  path?: string;
+};
+
+type BatchReadResult = {
+  failedPaths: string[];
+};
+
+type StoreDataState = {
+  projects: Project[];
+  progressPages: ProgressPage[];
+  tasks: Map<string, Task[]>;
+};
+
+type DataFolderUsage = {
+  hasData: boolean;
+  invalidPaths: string[];
+};
+
+function normalizeStoredTask(task: Task & { completedOccurrences?: Array<{ date: string; completedAt: string }> }): Task {
+  const kind: TaskKind = task.kind ?? ((task.subtasks?.length ?? 0) > 0 ? "composite" : "simple");
+  const subtasks = (task.subtasks ?? []).map((item) => ({ id: item.id, title: item.title }));
+  const legacyStates = (task.completedOccurrences ?? []).map((item) =>
+    buildNormalizedOccurrenceState(item.date, kind, subtasks, subtasks.map((subtask) => subtask.id), item.completedAt)
+  );
+  const occurrenceStates = (task.occurrenceStates ?? legacyStates).map((item) =>
+    buildNormalizedOccurrenceState(item.date, kind, subtasks, item.completedSubtaskIds ?? subtasks.map((subtask) => subtask.id), item.completedAt ?? null)
+  );
+  return {
+    ...task,
+    kind,
+    subtasks,
+    occurrenceStates
+  };
+}
+
+function isPartialPluginConfig(value: unknown): value is Partial<PluginConfig> {
+  return isRecord(value);
+}
+
+function isProjectsFile(value: unknown): value is ProjectsFile {
+  return isRecord(value) && Array.isArray(value.projects) && value.projects.every(isRecord);
+}
+
+function isProgressPagesFile(value: unknown): value is ProgressPagesFile {
+  return isRecord(value) && Array.isArray(value.pages) && value.pages.every(isRecord);
+}
+
+function isTasksFile(value: unknown): value is TasksFile {
+  return isRecord(value) && typeof value.month === "string" && Array.isArray(value.tasks) && value.tasks.every(isStoredTaskRecord);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStoredTaskRecord(value: unknown): value is Task {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const subtasks = value.subtasks;
+  const occurrenceStates = value.occurrenceStates;
+  const completedOccurrences = value.completedOccurrences;
+  return (
+    typeof value.id === "string" &&
+    typeof value.title === "string" &&
+    typeof value.date === "string" &&
+    typeof value.recurrence === "string" &&
+    Array.isArray(value.occurrenceDates) &&
+    value.occurrenceDates.every((date) => typeof date === "string") &&
+    (subtasks === undefined || (Array.isArray(subtasks) && subtasks.every(isTaskSubtaskRecord))) &&
+    (occurrenceStates === undefined || (Array.isArray(occurrenceStates) && occurrenceStates.every(isOccurrenceStateRecord))) &&
+    (completedOccurrences === undefined || (Array.isArray(completedOccurrences) && completedOccurrences.every(isCompletedOccurrenceRecord)))
+  );
+}
+
+function isTaskSubtaskRecord(value: unknown): value is TaskSubtask {
+  return isRecord(value) && typeof value.id === "string" && typeof value.title === "string";
+}
+
+function isOccurrenceStateRecord(value: unknown): value is TaskOccurrenceState {
+  return isRecord(value) && typeof value.date === "string";
+}
+
+function isCompletedOccurrenceRecord(value: unknown): value is { date: string; completedAt: string } {
+  return isRecord(value) && typeof value.date === "string" && typeof value.completedAt === "string";
 }
 
 function cloneTask(task: Task): Task {
   return {
     ...task,
+    subtasks: task.subtasks.map((item) => ({ ...item })),
     occurrenceDates: [...task.occurrenceDates],
-    completedOccurrences: task.completedOccurrences.map((item) => ({ ...item }))
+    occurrenceStates: task.occurrenceStates.map((item) => ({
+      ...item,
+      completedSubtaskIds: [...(item.completedSubtaskIds ?? [])]
+    }))
   };
 }
 
 function expandTask(task: Task): TaskOccurrence[] {
   return task.occurrenceDates.map((date, index) => {
-    const completedRecord = task.completedOccurrences.find((item) => item.date === date);
+    const state = getOccurrenceState(task, date);
+    const progress = getOccurrenceProgress(task, date);
     return {
       id: buildOccurrenceKey(task.id, date),
       taskId: task.id,
       occurrenceDate: date,
       occurrenceNumber: index + 1,
+      kind: task.kind,
       title: task.title,
       description: task.description,
       projectId: task.projectId,
@@ -692,8 +1123,13 @@ function expandTask(task: Task): TaskOccurrence[] {
       recurrence: task.recurrence,
       recurrenceCount: task.recurrenceCount ?? null,
       recurrenceUntil: task.recurrenceUntil ?? null,
-      completed: Boolean(completedRecord),
-      completedAt: completedRecord?.completedAt ?? null,
+      subtasks: task.subtasks.map((item) => ({ ...item })),
+      completedSubtaskIds: [...progress.completedSubtaskIds],
+      progress: progress.progress,
+      totalSteps: progress.totalSteps,
+      completedSteps: progress.completedSteps,
+      completed: progress.completed,
+      completedAt: state?.completedAt ?? null,
       createdAt: task.createdAt,
       updatedAt: task.updatedAt
     };
@@ -739,36 +1175,151 @@ function buildOccurrenceDates(input: TaskInput): string[] {
   return dates;
 }
 
-function resolveCompletedOccurrences(params: {
+function resolveOccurrenceStates(params: {
   input: TaskInput;
   original?: Task;
+  subtasks: TaskSubtask[];
   occurrenceDates: string[];
   timestamp: string;
   completedPatch?: boolean;
-}): Array<{ date: string; completedAt: string }> {
-  const { input, original, occurrenceDates, timestamp, completedPatch } = params;
+}): TaskOccurrenceState[] {
+  const { input, original, subtasks, occurrenceDates, timestamp, completedPatch } = params;
   if (completedPatch === true || (original === undefined && input.completed)) {
-    return occurrenceDates.map((date) => ({ date, completedAt: timestamp }));
+    return occurrenceDates.map((date) => buildNormalizedOccurrenceState(date, input.kind ?? "simple", subtasks, subtasks.map((item) => item.id), timestamp));
   }
   if (completedPatch === false) {
     return [];
   }
-  const existing = new Map((original?.completedOccurrences ?? []).map((item) => [item.date, item.completedAt]));
   return occurrenceDates
-    .filter((date) => existing.has(date))
-    .map((date) => ({ date, completedAt: existing.get(date)! }));
+    .map((date) => {
+      const existing = getOccurrenceState(original, date);
+      if (!existing) {
+        return null;
+      }
+      return buildNormalizedOccurrenceState(
+        date,
+        input.kind ?? "simple",
+        subtasks,
+        existing.completedSubtaskIds ?? (original ? getAllSubtaskIds(original) : []),
+        existing.completedAt ?? null
+      );
+    })
+    .filter((item): item is TaskOccurrenceState => Boolean(item));
 }
 
-function upsertCompletionRecord(
-  records: Array<{ date: string; completedAt: string }>,
-  date: string,
-  completedAt: string
-): Array<{ date: string; completedAt: string }> {
-  const existing = records.find((item) => item.date === date);
-  if (existing) {
-    return records.map((item) => (item.date === date ? { ...item, completedAt } : { ...item }));
+function normalizeSubtaskInputs(subtasks: TaskSubtaskInput[] | undefined, kind: TaskKind): TaskSubtaskInput[] {
+  if (kind === "simple") {
+    return [];
   }
-  return [...records.map((item) => ({ ...item })), { date, completedAt }];
+  const normalized = (subtasks ?? [])
+    .map((item) => ({ id: item.id, title: item.title.trim() }))
+    .filter((item) => item.title.length > 0);
+  if (normalized.length === 0) {
+    throw new Error("组合任务至少需要一个子任务");
+  }
+  return normalized;
+}
+
+function resolveTaskSubtasks(inputSubtasks: TaskSubtaskInput[] | undefined, kind: TaskKind, originalSubtasks: TaskSubtask[]): TaskSubtask[] {
+  if (kind === "simple") {
+    return [];
+  }
+  return (inputSubtasks ?? []).map((item) => {
+    const original = item.id ? originalSubtasks.find((entry) => entry.id === item.id) : undefined;
+    return {
+      id: original?.id ?? item.id ?? crypto.randomUUID(),
+      title: item.title.trim()
+    };
+  });
+}
+
+function getOccurrenceState(task: Task | undefined, date: string): TaskOccurrenceState | undefined {
+  return task?.occurrenceStates.find((item) => item.date === date);
+}
+
+function getAllSubtaskIds(task: Task): string[] {
+  if (task.kind === "composite") {
+    return task.subtasks.map((item) => item.id);
+  }
+  return [];
+}
+
+function buildNormalizedOccurrenceState(
+  date: string,
+  kind: TaskKind,
+  subtasks: TaskSubtask[],
+  completedSubtaskIds: string[],
+  completedAt: string | null
+): TaskOccurrenceState {
+  if (kind === "simple") {
+    return {
+      date,
+      completedAt: completedAt ?? toIsoLocal(now())
+    };
+  }
+  const allowedIds = new Set(subtasks.map((item) => item.id));
+  const uniqueIds = [...new Set(completedSubtaskIds)].filter((id) => allowedIds.has(id));
+  const isComplete = uniqueIds.length === subtasks.length;
+  return {
+    date,
+    completedSubtaskIds: uniqueIds,
+    completedAt: isComplete ? completedAt ?? toIsoLocal(now()) : null
+  };
+}
+
+function upsertOccurrenceState(task: Task, date: string, patch: { completedSubtaskIds: string[]; completedAt: string | null }): TaskOccurrenceState[] {
+  const nextState = buildNormalizedOccurrenceState(date, task.kind, task.subtasks, patch.completedSubtaskIds, patch.completedAt);
+  const existing = getOccurrenceState(task, date);
+  if (existing) {
+    return task.occurrenceStates.map((item) =>
+      item.date === date
+        ? nextState
+        : {
+            ...item,
+            completedSubtaskIds: [...(item.completedSubtaskIds ?? [])]
+          }
+    );
+  }
+  return [...task.occurrenceStates.map((item) => ({ ...item, completedSubtaskIds: [...(item.completedSubtaskIds ?? [])] })), nextState];
+}
+
+function getOccurrenceProgress(
+  task: Task,
+  date: string
+): { completed: boolean; progress: number; totalSteps: number; completedSteps: number; completedSubtaskIds: string[] } {
+  if (task.kind === "simple") {
+    const completed = Boolean(getOccurrenceState(task, date));
+    return {
+      completed,
+      progress: completed ? 1 : 0,
+      totalSteps: 1,
+      completedSteps: completed ? 1 : 0,
+      completedSubtaskIds: []
+    };
+  }
+
+  const totalSteps = Math.max(task.subtasks.length, 1);
+  const allowedIds = new Set(task.subtasks.map((item) => item.id));
+  const completedSubtaskIds = [...new Set(getOccurrenceState(task, date)?.completedSubtaskIds ?? [])].filter((id) => allowedIds.has(id));
+  const completedSteps = completedSubtaskIds.length;
+  return {
+    completed: completedSteps === totalSteps,
+    progress: completedSteps / totalSteps,
+    totalSteps,
+    completedSteps,
+    completedSubtaskIds
+  };
+}
+
+function summarizeOccurrencesProgress(occurrences: TaskOccurrence[]): { totalSteps: number; completedSteps: number } {
+  return occurrences.reduce(
+    (summary, occurrence) => {
+      summary.totalSteps += occurrence.totalSteps;
+      summary.completedSteps += occurrence.completedSteps;
+      return summary;
+    },
+    { totalSteps: 0, completedSteps: 0 }
+  );
 }
 
 function buildOccurrenceKey(taskId: string, date: string): string {
@@ -780,7 +1331,7 @@ function occurrenceKeysForTask(task: Task): Set<string> {
 }
 
 function isTaskFullyCompleted(task: Task): boolean {
-  return task.occurrenceDates.length > 0 && task.completedOccurrences.length === task.occurrenceDates.length;
+  return task.occurrenceDates.length > 0 && task.occurrenceDates.every((date) => getOccurrenceProgress(task, date).completed);
 }
 
 function detectRecurrenceFromDates(dates: string[]): TaskRecurrence {
@@ -823,18 +1374,13 @@ function normalizeDateOrUndefined(value?: string | null): string | null {
   return trimmed;
 }
 
-function collectMonthFiles(app: App, tasksFolder: string): string[] {
-  const folder = app.vault.getAbstractFileByPath(tasksFolder);
-  if (!(folder instanceof TFolder)) {
-    return [];
-  }
-  return folder.children
-    .filter((child) => !(child instanceof TFolder) && child.name.endsWith(".json"))
-    .map((child) => child.name.replace(/\.json$/, ""));
-}
-
 function sanitizeFolder(value: string): string {
   return value.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function isFolderAlreadyExistsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return message.includes("folder already exists") || message.includes("already exists");
 }
 
 function toMonthKeyFromTask(task: Task): string {

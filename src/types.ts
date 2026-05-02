@@ -1,10 +1,27 @@
 export type ProjectStatus = "active" | "paused" | "completed" | "archived";
 
 export type TaskRecurrence = "once" | "daily" | "weekly";
+export type TaskKind = "simple" | "composite";
 
 export type TaskUpdateScope = "series";
 
 export type TaskDeleteScope = "single" | "series";
+
+export type TaskSubtask = {
+  id: string;
+  title: string;
+};
+
+export type TaskSubtaskInput = {
+  id?: string;
+  title: string;
+};
+
+export type TaskOccurrenceState = {
+  date: string;
+  completedAt?: string | null;
+  completedSubtaskIds?: string[];
+};
 
 export type Project = {
   id: string;
@@ -18,6 +35,7 @@ export type Project = {
 
 export type Task = {
   id: string;
+  kind: TaskKind;
   title: string;
   description?: string;
   projectId?: string;
@@ -27,11 +45,9 @@ export type Task = {
   recurrence: TaskRecurrence;
   recurrenceCount?: number | null;
   recurrenceUntil?: string | null;
+  subtasks: TaskSubtask[];
   occurrenceDates: string[];
-  completedOccurrences: Array<{
-    date: string;
-    completedAt: string;
-  }>;
+  occurrenceStates: TaskOccurrenceState[];
   createdAt: string;
   updatedAt: string;
 };
@@ -41,6 +57,7 @@ export type TaskOccurrence = {
   taskId: string;
   occurrenceDate: string;
   occurrenceNumber: number;
+  kind: TaskKind;
   title: string;
   description?: string;
   projectId?: string;
@@ -50,6 +67,11 @@ export type TaskOccurrence = {
   recurrence: TaskRecurrence;
   recurrenceCount?: number | null;
   recurrenceUntil?: string | null;
+  subtasks: TaskSubtask[];
+  completedSubtaskIds: string[];
+  progress: number;
+  totalSteps: number;
+  completedSteps: number;
   completed: boolean;
   completedAt?: string | null;
   createdAt: string;
@@ -100,6 +122,7 @@ export type StoreSnapshot = {
 };
 
 export type TaskInput = {
+  kind?: TaskKind;
   title: string;
   description?: string;
   projectId?: string;
@@ -109,6 +132,7 @@ export type TaskInput = {
   recurrence: TaskRecurrence;
   recurrenceCount?: number | null;
   recurrenceUntil?: string | null;
+  subtasks?: TaskSubtaskInput[];
   completed?: boolean;
 };
 

@@ -23,6 +23,10 @@ export default class ProjectManagementPlugin extends Plugin {
       new Notice(error instanceof Error ? error.message : "插件初始化失败");
     }
 
+    this.app.workspace.onLayoutReady(() => {
+      void this.refreshStoreFromDisk(false);
+    });
+
     this.registerView(OVERVIEW_VIEW_TYPE, (leaf) => new OverviewView(leaf, this));
     this.registerView(TODAY_VIEW_TYPE, (leaf) => new TodayTasksView(leaf, this));
 
@@ -49,15 +53,27 @@ export default class ProjectManagementPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    try {
+      await this.store?.flushPendingWrites();
+    } catch (error) {
+      console.error("Failed to flush project management data before unload", error);
+    }
     await this.app.workspace.detachLeavesOfType(OVERVIEW_VIEW_TYPE);
     await this.app.workspace.detachLeavesOfType(TODAY_VIEW_TYPE);
   }
 
   async updateSettings(patch: Partial<PluginConfig>): Promise<void> {
-    this.settings = { ...this.settings, ...patch };
+    const previousSettings = { ...this.settings };
+    const nextSettings = { ...this.settings, ...patch };
     this.pendingSettings = {};
-    await this.savePluginSettings();
-    await this.store.setConfig(this.settings);
+    await this.store.setConfig(nextSettings);
+    this.settings = this.store.getConfig();
+    try {
+      await this.savePluginSettings();
+    } catch (error) {
+      this.settings = previousSettings;
+      throw error;
+    }
   }
 
   private async loadPluginSettings(): Promise<void> {
@@ -71,10 +87,12 @@ export default class ProjectManagementPlugin extends Plugin {
 
   private async activateOverviewView(): Promise<void> {
     await this.activateInMainArea(OVERVIEW_VIEW_TYPE);
+    void this.refreshStoreFromDisk();
   }
 
   private async activateTodayView(): Promise<void> {
     await this.activateInRightSidebar(TODAY_VIEW_TYPE);
+    void this.refreshStoreFromDisk();
   }
 
   private async activateInMainArea(type: string): Promise<void> {
@@ -103,5 +121,20 @@ export default class ProjectManagementPlugin extends Plugin {
     }
     await leaf.setViewState({ type, active: true });
     await this.app.workspace.revealLeaf(leaf);
+  }
+
+  private async refreshStoreFromDisk(notifyOnError = true): Promise<void> {
+    if (!this.store) {
+      return;
+    }
+    try {
+      await this.store.refreshFromDisk();
+      this.settings = this.store.getConfig();
+    } catch (error) {
+      console.error("Failed to refresh project management data from disk", error);
+      if (notifyOnError) {
+        new Notice(error instanceof Error ? error.message : "刷新数据失败");
+      }
+    }
   }
 }
