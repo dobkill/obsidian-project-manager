@@ -1,7 +1,8 @@
-import { Notice, Plugin, WorkspaceLeaf } from "obsidian";
+import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { DEFAULT_CONFIG, ProjectManagementStore } from "./storage/store";
 import { ProjectManagementSettingTab } from "./settings";
 import { PluginConfig } from "./types";
+import { DIALOG_VIEW_TYPE, QuickDialogView } from "./views/dialogView";
 import { OVERVIEW_VIEW_TYPE, OverviewView } from "./views/overviewView";
 import { TODAY_VIEW_TYPE, TodayTasksView } from "./views/todayView";
 
@@ -25,16 +26,21 @@ export default class ProjectManagementPlugin extends Plugin {
 
     this.app.workspace.onLayoutReady(() => {
       void this.refreshStoreFromDisk(false);
+      void this.scanNoteTasksInBackground();
     });
 
     this.registerView(OVERVIEW_VIEW_TYPE, (leaf) => new OverviewView(leaf, this));
     this.registerView(TODAY_VIEW_TYPE, (leaf) => new TodayTasksView(leaf, this));
+    this.registerView(DIALOG_VIEW_TYPE, (leaf) => new QuickDialogView(leaf, this));
 
     this.addRibbonIcon("layout-dashboard", "打开项目总览", async () => {
       await this.activateOverviewView();
     });
     this.addRibbonIcon("check-square", "打开今日任务", async () => {
       await this.activateTodayView();
+    });
+    this.addRibbonIcon("message-square-plus", "打开快速记录", async () => {
+      await this.activateDialogView();
     });
 
     this.addCommand({
@@ -49,6 +55,28 @@ export default class ProjectManagementPlugin extends Plugin {
       callback: async () => this.activateTodayView()
     });
 
+    this.addCommand({
+      id: "open-quick-dialog",
+      name: "打开快速记录",
+      callback: async () => this.activateDialogView()
+    });
+
+    this.addCommand({
+      id: "scan-note-tasks",
+      name: "扫描全库项目任务块",
+      callback: async () => this.scanNoteTasksInBackground(true)
+    });
+
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (file instanceof TFile && file.extension === "md") {
+          window.setTimeout(() => {
+            void this.store.syncNoteFile(file).catch((error) => console.error("Failed to sync note tasks", error));
+          }, 600);
+        }
+      })
+    );
+
     this.addSettingTab(new ProjectManagementSettingTab(this.app, this));
   }
 
@@ -60,6 +88,7 @@ export default class ProjectManagementPlugin extends Plugin {
     }
     await this.app.workspace.detachLeavesOfType(OVERVIEW_VIEW_TYPE);
     await this.app.workspace.detachLeavesOfType(TODAY_VIEW_TYPE);
+    await this.app.workspace.detachLeavesOfType(DIALOG_VIEW_TYPE);
   }
 
   async updateSettings(patch: Partial<PluginConfig>): Promise<void> {
@@ -92,6 +121,11 @@ export default class ProjectManagementPlugin extends Plugin {
 
   private async activateTodayView(): Promise<void> {
     await this.activateInRightSidebar(TODAY_VIEW_TYPE);
+    void this.refreshStoreFromDisk();
+  }
+
+  private async activateDialogView(): Promise<void> {
+    await this.activateInRightSidebar(DIALOG_VIEW_TYPE);
     void this.refreshStoreFromDisk();
   }
 
@@ -134,6 +168,23 @@ export default class ProjectManagementPlugin extends Plugin {
       console.error("Failed to refresh project management data from disk", error);
       if (notifyOnError) {
         new Notice(error instanceof Error ? error.message : "刷新数据失败");
+      }
+    }
+  }
+
+  private async scanNoteTasksInBackground(notify = false): Promise<void> {
+    if (!this.store) {
+      return;
+    }
+    try {
+      const count = await this.store.syncAllNoteTasks();
+      if (notify) {
+        new Notice(`已同步 ${count} 个笔记任务`);
+      }
+    } catch (error) {
+      console.error("Failed to scan note tasks", error);
+      if (notify) {
+        new Notice(error instanceof Error ? error.message : "扫描笔记任务失败");
       }
     }
   }

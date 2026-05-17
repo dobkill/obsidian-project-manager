@@ -1,5 +1,5 @@
 import { App, ButtonComponent, Modal, Notice, Setting } from "obsidian";
-import { Project, Task, TaskDeleteScope, TaskInput, TaskKind, TaskOccurrence, TaskRecurrence, TaskSubtaskInput, TaskUpdateScope } from "../types";
+import { Project, Task, TaskDeleteScope, TaskInput, TaskKind, TaskOccurrence, TaskPriority, TaskRecurrence, TaskStatus, TaskSubtaskInput, TaskUpdateScope } from "../types";
 
 type TaskModalOptions = {
   title: string;
@@ -30,7 +30,6 @@ export class TaskModal extends Modal {
     const state: TaskInput = { ...this.options.initial };
     state.kind = state.kind ?? "simple";
     state.subtasks = [...(state.subtasks ?? [])];
-    const saveScope: TaskUpdateScope = "series";
 
     if (this.options.existingTask?.occurrenceDates.length && this.options.existingTask.occurrenceDates.length > 1) {
       contentEl.createDiv({
@@ -113,15 +112,60 @@ export class TaskModal extends Modal {
       });
 
     new Setting(contentEl)
+      .setName("状态")
+      .addDropdown((dropdown) => {
+        const labels: Record<TaskStatus, string> = {
+          todo: "待办",
+          doing: "进行中",
+          blocked: "阻塞",
+          done: "已完成"
+        };
+        (Object.keys(labels) as TaskStatus[]).forEach((key) => dropdown.addOption(key, labels[key]));
+        dropdown.setValue(state.status ?? "todo");
+        dropdown.onChange((value) => {
+          state.status = value as TaskStatus;
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("优先级")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("", "无");
+        const labels: Record<TaskPriority, string> = {
+          low: "低",
+          medium: "中",
+          high: "高",
+          urgent: "紧急"
+        };
+        (Object.keys(labels) as TaskPriority[]).forEach((key) => dropdown.addOption(key, labels[key]));
+        dropdown.setValue(state.priority ?? "");
+        dropdown.onChange((value) => {
+          state.priority = (value || undefined) as TaskPriority | undefined;
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("标签")
+      .setDesc("多个标签用逗号分隔")
+      .addText((text) =>
+        text.setPlaceholder("例如 parser, ui").setValue((state.tags ?? []).join(", ")).onChange((value) => {
+          state.tags = value
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean);
+        })
+      );
+
+    new Setting(contentEl)
       .setName("重复类型")
       .setDesc("单次、每日重复、每周此时重复")
       .addDropdown((dropdown) => {
-        const labels: Record<TaskRecurrence, string> = {
-          once: "单次任务",
-          daily: "每日重复",
-          weekly: "每周此时重复"
-        };
-        (Object.keys(labels) as TaskRecurrence[]).forEach((key) => dropdown.addOption(key, labels[key]));
+        const labels: Array<[TaskRecurrence, string]> = [
+          ["once", "单次任务"],
+          ["daily", "每日重复"],
+          ["weekly", "每周此时重复"]
+        ];
+        labels.forEach(([key, label]) => dropdown.addOption(key, label));
         dropdown.setValue(state.recurrence);
         dropdown.onChange((value) => {
           state.recurrence = value as TaskRecurrence;
@@ -202,16 +246,29 @@ export class TaskModal extends Modal {
 
     const footer = contentEl.createDiv({ cls: "pm-modal-actions" });
     new ButtonComponent(footer)
-      .setButtonText("保存")
+      .setButtonText(this.options.occurrenceContext ? "保存整条系列" : "保存")
       .setCta()
       .onClick(async () => {
         try {
-          await this.options.onSubmit(state, saveScope);
+          await this.options.onSubmit(state, "series");
           this.close();
         } catch (error) {
           new Notice(error instanceof Error ? error.message : "保存失败");
         }
       });
+
+    if (this.options.occurrenceContext && this.options.existingTask?.occurrenceDates.length && this.options.existingTask.occurrenceDates.length > 1) {
+      new ButtonComponent(footer)
+        .setButtonText("仅保存本次时间")
+        .onClick(async () => {
+          try {
+            await this.options.onSubmit(state, "occurrence");
+            this.close();
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : "保存失败");
+          }
+        });
+    }
 
     if (this.options.onDelete) {
       if (this.options.allowSingleDelete) {
