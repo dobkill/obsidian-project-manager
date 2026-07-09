@@ -1130,6 +1130,111 @@ var markdown_type_default = '# \u5FEB\u901F\u8BB0\u5F55\u683C\u5F0F\u89C4\u8303\
 // src/utils/markdownGuide.ts
 var MARKDOWN_FORMAT_GUIDE = markdown_type_default.trimEnd();
 
+// src/domain/occurrenceSchedule.ts
+function isCompletionGatedTask(task) {
+  return isExecutableTask(task) && task.consumeRequiresCompletion;
+}
+function getEffectiveOccurrenceDates(task, referenceDate) {
+  if (!isCompletionGatedTask(task)) {
+    return [...task.occurrenceDates];
+  }
+  const completedDates = getCompletedOccurrenceDates(task);
+  const activeDate = getCompletionGatedActiveDate(task, referenceDate);
+  return uniqueDateKeys(activeDate ? [...completedDates, activeDate] : completedDates);
+}
+function getCompletionGatedActiveDate(task, referenceDate) {
+  if (!isCompletionGatedTask(task)) {
+    return null;
+  }
+  const progress = getTaskExecutionProgress(task);
+  if (progress.completedSeries) {
+    return null;
+  }
+  const completedDates = getCompletedOccurrenceDates(task);
+  const dueDate = completedDates.length === 0 ? task.date : toDateKey(nextRecurrenceDateAfter(parseDateKey(completedDates[completedDates.length - 1]), task));
+  const activeDate = compareDateKeys(dueDate, referenceDate) < 0 ? referenceDate : dueDate;
+  if (task.recurrenceUntil && compareDateKeys(activeDate, task.recurrenceUntil) > 0) {
+    return null;
+  }
+  return activeDate;
+}
+function isOccurrenceDateAvailable(task, date, referenceDate) {
+  if (task.occurrenceDates.includes(date)) {
+    return true;
+  }
+  return getEffectiveOccurrenceDates(task, referenceDate).includes(date);
+}
+function getTaskExecutionProgress(task) {
+  if (!isExecutableTask(task)) {
+    return { total: 0, completed: 0, remaining: 0, completedSeries: false };
+  }
+  const completed = getCompletedOccurrenceCount(task);
+  if (task.consumeRequiresCompletion) {
+    const total2 = getExecutionTargetCount(task);
+    return {
+      total: total2,
+      completed,
+      remaining: Math.max(0, total2 - completed),
+      completedSeries: total2 > 0 && completed >= total2
+    };
+  }
+  const total = task.occurrenceDates.filter((date) => {
+    if (task.occurrenceStates.some((state) => state.date === date)) {
+      return true;
+    }
+    return !isAttentionStatus(task.status);
+  }).length;
+  return {
+    total,
+    completed,
+    remaining: Math.max(0, total - completed),
+    completedSeries: total > 0 && completed >= total
+  };
+}
+function appendOccurrenceDate(task, date) {
+  if (task.occurrenceDates.includes(date)) {
+    return task;
+  }
+  task.occurrenceDates = uniqueDateKeys([...task.occurrenceDates, date]);
+  return task;
+}
+function occurrenceExecutionLabel(occurrence) {
+  if (!occurrence.consumeRequiresCompletion || !occurrence.recurrenceCount || occurrence.recurrenceCount <= 1) {
+    return null;
+  }
+  const consumed = occurrence.completed ? occurrence.occurrenceNumber : Math.max(0, occurrence.occurrenceNumber - 1);
+  const remaining = Math.max(0, occurrence.recurrenceCount - consumed);
+  return `\u5269\u4F59 ${remaining} \u6B21`;
+}
+function getExecutionTargetCount(task) {
+  return Math.max(1, task.recurrenceCount ?? task.occurrenceDates.length);
+}
+function getCompletedOccurrenceCount(task) {
+  return getCompletedOccurrenceDates(task).length;
+}
+function getCompletedOccurrenceDates(task) {
+  return uniqueDateKeys(task.occurrenceStates.filter((state) => Boolean(state.completedAt)).map((state) => state.date));
+}
+function nextRecurrenceDateAfter(reference, task) {
+  if (task.recurrence === "weekly") {
+    const anchorWeekday = parseDateKey(task.date).getDay();
+    const dayOffset = (anchorWeekday - reference.getDay() + 7) % 7 || 7;
+    return addDays(reference, dayOffset);
+  }
+  if (task.recurrence === "monthly") {
+    const anchorDay = parseDateKey(task.date).getDate();
+    const sameMonth = addMonthsKeepingAnchorDay(new Date(reference.getFullYear(), reference.getMonth(), 1), 0, anchorDay);
+    if (sameMonth.getTime() > reference.getTime()) {
+      return sameMonth;
+    }
+    return addMonthsKeepingAnchorDay(reference, 1, anchorDay);
+  }
+  return addDays(reference, 1);
+}
+function uniqueDateKeys(dates) {
+  return [...new Set(dates)].sort(compareDateKeys);
+}
+
 // src/storage/store.ts
 var DEFAULT_CONFIG = {
   version: "0.3.0",
@@ -1283,10 +1388,11 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     return [...this.tasks.values()].flat().map(cloneTask);
   }
   getAllTaskOccurrences() {
-    return this.getAllTasks().flatMap((task) => expandTask(task)).sort(compareOccurrences);
+    const referenceDate = toDateKey(now());
+    return this.getAllTasks().flatMap((task) => expandTask(task, referenceDate)).sort(compareOccurrences);
   }
   getTasksForDate(date) {
-    return this.getAllTaskOccurrences().filter((task) => task.date === date);
+    return this.getAllTasks().flatMap((task) => expandTask(task, date)).filter((task) => task.date === date).sort(compareOccurrences);
   }
   getTasksForProject(projectId) {
     return this.getAllTasks().filter((task) => task.projectId === projectId).sort(compareSeriesTasks);
@@ -1302,7 +1408,7 @@ var ProjectManagementStore = class extends import_obsidian.Events {
   }
   getOccurrencesForTask(taskId) {
     const task = this.findTask(taskId);
-    return task ? expandTask(task).sort(compareOccurrences) : [];
+    return task ? expandTask(task, toDateKey(now())).sort(compareOccurrences) : [];
   }
   getTask(taskId) {
     const task = this.findTask(taskId);
@@ -1466,10 +1572,11 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     if (!original) {
       throw new Error("\u4EFB\u52A1\u4E0D\u5B58\u5728");
     }
-    if (!original.occurrenceDates.includes(date)) {
+    if (!isOccurrenceDateAvailable(original, date, date)) {
       throw new Error("\u4EFB\u52A1\u53D1\u751F\u65E5\u671F\u4E0D\u5B58\u5728");
     }
     const next = cloneTask(original);
+    appendOccurrenceDate(next, date);
     next.occurrenceStates = completed ? upsertOccurrenceState(original, date, {
       completedSubtaskIds: getAllSubtaskIds(original),
       completedAt: toIsoLocal(now())
@@ -1522,23 +1629,25 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     if (!original) {
       throw new Error("\u4EFB\u52A1\u4E0D\u5B58\u5728");
     }
-    if (!original.occurrenceDates.includes(date)) {
+    if (!isOccurrenceDateAvailable(original, date, date)) {
       throw new Error("\u4EFB\u52A1\u53D1\u751F\u65E5\u671F\u4E0D\u5B58\u5728");
     }
-    if (original.occurrenceDates.length === 1) {
+    const source = cloneTask(original);
+    appendOccurrenceDate(source, date);
+    if (source.occurrenceDates.length === 1) {
       await this.updateTask(
         taskId,
         {
-          title: patch.title ?? original.title,
-          description: patch.description ?? original.description,
-          startTime: patch.startTime ?? original.startTime,
-          endTime: patch.endTime ?? original.endTime
+          title: patch.title ?? source.title,
+          description: patch.description ?? source.description,
+          startTime: patch.startTime ?? source.startTime,
+          endTime: patch.endTime ?? source.endTime
         },
         "series"
       );
       return;
     }
-    const occurrence = expandTask(original).find((item) => item.date === date);
+    const occurrence = expandTask(source, date).find((item) => item.date === date);
     if (!occurrence) {
       throw new Error("\u4EFB\u52A1\u53D1\u751F\u65E5\u671F\u4E0D\u5B58\u5728");
     }
@@ -1557,11 +1666,11 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     if (startMinutes !== null && endMinutes !== null && startMinutes >= endMinutes) {
       throw new Error("\u7ED3\u675F\u65F6\u95F4\u5FC5\u987B\u665A\u4E8E\u5F00\u59CB\u65F6\u95F4");
     }
-    const next = cloneTask(original);
+    const next = cloneTask(source);
     next.occurrenceOverrides = replaceOccurrenceOverride(
       next,
       date,
-      buildOccurrenceDetailsOverride(original, date, {
+      buildOccurrenceDetailsOverride(source, date, {
         title,
         description,
         startTime: start || void 0,
@@ -2064,20 +2173,38 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     if (!task) {
       return;
     }
-    if (!task.occurrenceDates.includes(date)) {
+    if (!isOccurrenceDateAvailable(task, date, date)) {
       throw new Error("\u4EFB\u52A1\u53D1\u751F\u65E5\u671F\u4E0D\u5B58\u5728");
     }
-    if (task.occurrenceDates.length === 1) {
+    const source = cloneTask(task);
+    appendOccurrenceDate(source, date);
+    const executionProgress = getTaskExecutionProgress(source);
+    if (source.occurrenceDates.length === 1 || isCompletionGatedTask(source) && executionProgress.total <= 1) {
       const removed = this.replaceTasks([task.id], []);
       await this.persistMonths(monthsForTasks(removed));
       await this.reloadCurrentFolderData();
       this.trigger("changed");
       return;
     }
-    const next = cloneTask(task);
-    next.occurrenceDates = task.occurrenceDates.filter((entry) => entry !== date);
-    next.occurrenceStates = task.occurrenceStates.filter((entry) => entry.date !== date);
-    next.occurrenceOverrides = task.occurrenceOverrides.filter((entry) => entry.date !== date);
+    if (isCompletionGatedTask(source)) {
+      const next2 = cloneTask(source);
+      next2.occurrenceDates = source.occurrenceDates.filter((entry) => entry !== date);
+      next2.occurrenceStates = source.occurrenceStates.filter((entry) => entry.date !== date);
+      next2.occurrenceOverrides = replaceOccurrenceOverride(next2, date, { date, skipped: true, reason: "deleted" });
+      next2.recurrenceCount = Math.max(1, executionProgress.total - 1);
+      next2.updatedAt = toIsoLocal(now());
+      next2.revision = (next2.revision ?? 0) + 1;
+      this.assertCompositeTaskConsistency([next2], /* @__PURE__ */ new Set([task.id]));
+      this.replaceTasks([task.id], [next2]);
+      await this.persistMonths(monthsForTasks([task, next2]));
+      await this.reloadCurrentFolderData();
+      this.trigger("changed");
+      return;
+    }
+    const next = cloneTask(source);
+    next.occurrenceDates = source.occurrenceDates.filter((entry) => entry !== date);
+    next.occurrenceStates = source.occurrenceStates.filter((entry) => entry.date !== date);
+    next.occurrenceOverrides = source.occurrenceOverrides.filter((entry) => entry.date !== date);
     if (next.occurrenceDates.length > 0) {
       next.date = next.occurrenceDates[0];
       next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
@@ -2099,28 +2226,36 @@ var ProjectManagementStore = class extends import_obsidian.Events {
       return;
     }
     const effectiveDate = throughDate ?? task.occurrenceDates[task.occurrenceDates.length - 1];
-    if (!task.occurrenceDates.includes(effectiveDate)) {
+    if (!isOccurrenceDateAvailable(task, effectiveDate, effectiveDate)) {
       throw new Error("\u4EFB\u52A1\u53D1\u751F\u65E5\u671F\u4E0D\u5B58\u5728");
     }
-    const next = cloneTask(task);
-    const remainingDates = task.occurrenceDates.filter((date) => compareDateKeys(date, effectiveDate) <= 0);
-    if (remainingDates.length === 0) {
+    const source = cloneTask(task);
+    appendOccurrenceDate(source, effectiveDate);
+    const next = cloneTask(source);
+    const effectiveDates = isCompletionGatedTask(source) ? getEffectiveOccurrenceDates(source, effectiveDate) : source.occurrenceDates;
+    const datesToComplete = effectiveDates.filter((date) => compareDateKeys(date, effectiveDate) <= 0);
+    if (datesToComplete.length === 0) {
       throw new Error("\u6CA1\u6709\u53EF\u4FDD\u7559\u7684\u4EFB\u52A1\u53D1\u751F\u65E5\u671F");
     }
     const stamp = toIsoLocal(now());
-    next.occurrenceDates = remainingDates;
-    next.occurrenceOverrides = task.occurrenceOverrides.filter((entry) => remainingDates.includes(entry.date));
-    next.occurrenceStates = remainingDates.reduce((records, date) => {
-      const existing = getOccurrenceState(task, date);
+    next.occurrenceDates = datesToComplete;
+    next.occurrenceOverrides = source.occurrenceOverrides.filter((entry) => datesToComplete.includes(entry.date));
+    next.occurrenceStates = datesToComplete.reduce((records, date) => {
+      const existing = getOccurrenceState(source, date);
       records.push(
-        buildNormalizedOccurrenceState(date, task.kind, task.subtasks, getAllSubtaskIds(task), existing?.completedAt ?? stamp)
+        buildNormalizedOccurrenceState(date, source.kind, source.subtasks, getAllSubtaskIds(source), existing?.completedAt ?? stamp)
       );
       return records;
     }, []);
     next.date = next.occurrenceDates[0];
-    next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
-    next.recurrenceCount = next.occurrenceDates.length;
-    next.recurrenceUntil = next.occurrenceDates.length > 1 ? next.occurrenceDates[next.occurrenceDates.length - 1] : null;
+    if (isCompletionGatedTask(next)) {
+      next.recurrenceCount = next.occurrenceDates.length;
+      next.recurrenceUntil = null;
+    } else {
+      next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
+      next.recurrenceCount = next.occurrenceDates.length;
+      next.recurrenceUntil = next.occurrenceDates.length > 1 ? next.occurrenceDates[next.occurrenceDates.length - 1] : null;
+    }
     next.updatedAt = stamp;
     next.revision = (next.revision ?? 0) + 1;
     this.assertCompositeTaskConsistency([next], /* @__PURE__ */ new Set([task.id]));
@@ -2364,7 +2499,7 @@ var ProjectManagementStore = class extends import_obsidian.Events {
     const sameProject = this.getAllTasks().filter(
       (task) => normalizeImportIdentity2(task.title) === normalizeImportIdentity2(title) && (task.projectId ?? void 0) === projectId
     );
-    const sameDate = sameProject.find((task) => task.occurrenceDates.includes(date));
+    const sameDate = sameProject.find((task) => isOccurrenceDateAvailable(task, date, date));
     if (sameDate) {
       return sameDate;
     }
@@ -2372,7 +2507,7 @@ var ProjectManagementStore = class extends import_obsidian.Events {
   }
   findTaskByCompletionIdentity(title, projectId, date) {
     return this.getAllTasks().find(
-      (task) => normalizeImportIdentity2(task.title) === normalizeImportIdentity2(title) && (task.projectId ?? void 0) === projectId && task.occurrenceDates.includes(date)
+      (task) => normalizeImportIdentity2(task.title) === normalizeImportIdentity2(title) && (task.projectId ?? void 0) === projectId && isOccurrenceDateAvailable(task, date, date)
     );
   }
   findTaskByTitle(title, projectId) {
@@ -3343,8 +3478,8 @@ function cloneTask(task) {
     mindmapComments: task.mindmapComments.map((item) => ({ ...item }))
   };
 }
-function expandTask(task) {
-  return task.occurrenceDates.flatMap((date, index) => {
+function expandTask(task, referenceDate = toDateKey(now())) {
+  return getEffectiveOccurrenceDates(task, referenceDate).flatMap((date, index) => {
     const override = getOccurrenceOverride(task, date);
     if (override?.skipped) {
       return [];
@@ -3563,7 +3698,7 @@ function buildOccurrenceKey(taskId, date) {
   return `${taskId}::${date}`;
 }
 function occurrenceKeysForTask(task) {
-  return new Set(task.occurrenceDates.map((date) => buildOccurrenceKey(task.id, date)));
+  return new Set(getEffectiveOccurrenceDates(task, toDateKey(now())).map((date) => buildOccurrenceKey(task.id, date)));
 }
 function assertMutableOccurrenceDate(date) {
   if (compareDateKeys(date, toDateKey(now())) < 0) {
@@ -3571,6 +3706,9 @@ function assertMutableOccurrenceDate(date) {
   }
 }
 function isTaskFullyCompleted2(task) {
+  if (isCompletionGatedTask(task)) {
+    return getTaskExecutionProgress(task).completedSeries;
+  }
   return task.occurrenceDates.length > 0 && task.occurrenceDates.every((date) => getOccurrenceProgress(task, date).completed);
 }
 function normalizePositiveInteger(value) {
@@ -6236,7 +6374,14 @@ var OverviewView = class extends BaseProjectView {
       cardTop.createDiv({ cls: "pm-timeline-project", text: project?.name ?? "\u672A\u5F52\u5C5E\u9879\u76EE" });
       cardTop.createSpan({ cls: "pm-timeline-status", text: isCurrent ? "\u8FDB\u884C\u4E2D" : isOverdue ? "\u903E\u671F" : "\u5F85\u529E" });
       card.createDiv({ cls: "pm-timeline-title", text: task.title });
-      card.createDiv({ cls: "pm-timeline-meta", text: `${recurrenceLabel2(task.recurrence, task.recurrenceCount, task.recurrenceUntil)} \xB7 ${formatOccurrenceWindow(task)}` });
+      card.createDiv({
+        cls: "pm-timeline-meta",
+        text: [
+          recurrenceLabel2(task.recurrence, task.recurrenceCount, task.recurrenceUntil),
+          formatOccurrenceWindow(task),
+          occurrenceExecutionLabel(task)
+        ].filter(Boolean).join(" \xB7 ")
+      });
       const progressRow = card.createDiv({ cls: "pm-timeline-progress" });
       progressRow.createSpan({ text: `${progress.completedSteps}/${totalSteps} \u6B65 \xB7 ${percent}%` });
       progressRow.createDiv({ cls: "pm-timeline-progress-bar" }).createDiv({
@@ -6431,6 +6576,10 @@ var OverviewView = class extends BaseProjectView {
     meta.createSpan({ text: project?.name ?? "\u672A\u5F52\u5C5E\u9879\u76EE" });
     if ((task.recurrenceCount ?? 1) > 1 || task.recurrenceUntil) {
       meta.createSpan({ text: `\u7B2C ${task.occurrenceNumber} \u6B21` });
+    }
+    const executionLabel = occurrenceExecutionLabel(task);
+    if (executionLabel) {
+      meta.createSpan({ text: executionLabel });
     }
     if (task.kind === "composite") {
       meta.createSpan({ text: `${displayProgress.completedSteps}/${displayProgress.totalSteps} \u5B50\u4EFB\u52A1` });
@@ -8310,14 +8459,12 @@ function isOccurrenceOverdue(task, today, currentMinute) {
   if (!isExecutableTask(task) || !isActionableStatus(task.status) || task.completed) {
     return false;
   }
-  if (compareDateKeys(task.date, today) < 0) {
-    return true;
-  }
   if (task.date !== today) {
     return false;
   }
+  const start = parseTimeToMinutes(task.startTime);
   const end = parseTimeToMinutes(task.endTime);
-  return end !== null && end <= currentMinute;
+  return start !== null && end !== null && start <= currentMinute && end <= currentMinute;
 }
 function formatOccurrenceWindow(task) {
   return task.startTime && task.endTime ? `${task.startTime} - ${task.endTime}` : "\u672A\u6392\u671F";
@@ -8471,22 +8618,13 @@ function taskProgressSteps(task) {
   if (task.kind === "composite") {
     return { total: 0, completed: 0 };
   }
-  const completedDates = new Set(task.occurrenceStates.map((state) => state.date));
-  const total = task.occurrenceDates.filter((date) => {
-    if (completedDates.has(date)) {
-      return true;
-    }
-    if (task.consumeRequiresCompletion) {
-      return false;
-    }
-    return !isAttentionStatus(task.status);
-  }).length;
-  return {
-    total,
-    completed: task.occurrenceStates.length
-  };
+  const progress = getTaskExecutionProgress(task);
+  return { total: progress.total, completed: progress.completed };
 }
 function isTaskSeriesCompleted(task) {
+  if (task.kind === "simple" && task.consumeRequiresCompletion) {
+    return getTaskExecutionProgress(task).completedSeries;
+  }
   if (task.occurrenceDates.length === 0) {
     return false;
   }
@@ -8647,6 +8785,10 @@ var TodayTasksView = class extends BaseProjectView {
       appendBadge2(meta, task.startTime && task.endTime ? `${task.startTime}-${task.endTime}` : "\u672A\u6392\u671F", "muted");
       appendBadge2(meta, recurrenceLabel3(task), "repeat");
       appendBadge2(meta, statusLabel3(task.status), `status-${task.status}`);
+      const executionLabel = occurrenceExecutionLabel(task);
+      if (executionLabel) {
+        appendBadge2(meta, executionLabel, "repeat");
+      }
       appendBadge2(meta, this.plugin.store.getProject(task.projectId)?.name ?? "\u672A\u5F52\u5C5E\u9879\u76EE", "tag");
       if (task.kind === "composite") {
         appendBadge2(meta, `${displayProgress.completedSteps}/${displayProgress.totalSteps} \u5B50\u9879`, "priority-medium");
@@ -8869,6 +9011,9 @@ function statusLabel3(status) {
   return statusLabel(status);
 }
 function isTaskSeriesCompleted2(task) {
+  if (task.kind === "simple" && task.consumeRequiresCompletion) {
+    return getTaskExecutionProgress(task).completedSeries;
+  }
   if (task.occurrenceDates.length === 0) {
     return false;
   }

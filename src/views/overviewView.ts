@@ -28,11 +28,11 @@ import {
   SINGLE_TASK_RECURRENCE_COUNT,
   isActionableOccurrence,
   isActionableStatus,
-  isAttentionStatus,
   isExecutableTask,
   recurrenceLabel as formatRecurrenceLabel,
   statusLabel as formatStatusLabel
 } from "../domain/taskRules";
+import { getTaskExecutionProgress, occurrenceExecutionLabel } from "../domain/occurrenceSchedule";
 import {
   CompositeDisplayOccurrence,
   buildCompositeDisplayOccurrences,
@@ -397,7 +397,14 @@ export class OverviewView extends BaseProjectView {
       cardTop.createDiv({ cls: "pm-timeline-project", text: project?.name ?? "未归属项目" });
       cardTop.createSpan({ cls: "pm-timeline-status", text: isCurrent ? "进行中" : isOverdue ? "逾期" : "待办" });
       card.createDiv({ cls: "pm-timeline-title", text: task.title });
-      card.createDiv({ cls: "pm-timeline-meta", text: `${recurrenceLabel(task.recurrence, task.recurrenceCount, task.recurrenceUntil)} · ${formatOccurrenceWindow(task)}` });
+      card.createDiv({
+        cls: "pm-timeline-meta",
+        text: [
+          recurrenceLabel(task.recurrence, task.recurrenceCount, task.recurrenceUntil),
+          formatOccurrenceWindow(task),
+          occurrenceExecutionLabel(task)
+        ].filter(Boolean).join(" · ")
+      });
       const progressRow = card.createDiv({ cls: "pm-timeline-progress" });
       progressRow.createSpan({ text: `${progress.completedSteps}/${totalSteps} 步 · ${percent}%` });
       progressRow.createDiv({ cls: "pm-timeline-progress-bar" }).createDiv({
@@ -608,6 +615,10 @@ export class OverviewView extends BaseProjectView {
     meta.createSpan({ text: project?.name ?? "未归属项目" });
     if ((task.recurrenceCount ?? 1) > 1 || task.recurrenceUntil) {
       meta.createSpan({ text: `第 ${task.occurrenceNumber} 次` });
+    }
+    const executionLabel = occurrenceExecutionLabel(task);
+    if (executionLabel) {
+      meta.createSpan({ text: executionLabel });
     }
     if (task.kind === "composite") {
       meta.createSpan({ text: `${displayProgress.completedSteps}/${displayProgress.totalSteps} 子任务` });
@@ -2713,14 +2724,12 @@ function isOccurrenceOverdue(task: TaskOccurrence, today: string, currentMinute:
   if (!isExecutableTask(task) || !isActionableStatus(task.status) || task.completed) {
     return false;
   }
-  if (compareDateKeys(task.date, today) < 0) {
-    return true;
-  }
   if (task.date !== today) {
     return false;
   }
+  const start = parseTimeToMinutes(task.startTime);
   const end = parseTimeToMinutes(task.endTime);
-  return end !== null && end <= currentMinute;
+  return start !== null && end !== null && start <= currentMinute && end <= currentMinute;
 }
 
 function formatOccurrenceWindow(task: TaskOccurrence): string {
@@ -2860,11 +2869,12 @@ function containerDateRange(task: Task, childTasks: Task[]): { startDate: string
 }
 
 function completionSummary(task: Task): string {
-  const totalSteps = task.kind === "composite" ? task.occurrenceDates.length * task.subtasks.length : task.occurrenceDates.length;
+  const execution = taskProgressSteps(task);
+  const totalSteps = task.kind === "composite" ? task.occurrenceDates.length * task.subtasks.length : execution.total;
   const completedSteps =
     task.kind === "composite"
       ? task.occurrenceStates.reduce((sum, state) => sum + (state.completedSubtaskIds?.length ?? 0), 0)
-      : task.occurrenceStates.length;
+      : execution.completed;
   const ratio = totalSteps === 0 ? 0 : Math.round((completedSteps / totalSteps) * 100);
   const label = task.kind === "composite" ? "子任务" : "次";
   return `${completedSteps}/${totalSteps} ${label} · ${ratio}%`;
@@ -2877,11 +2887,12 @@ function completionSummaryWithChildren(task: Task, childTasks: Task[]): string {
 }
 
 function seriesProgress(task: Task): number {
-  const totalSteps = task.kind === "composite" ? task.occurrenceDates.length * task.subtasks.length : task.occurrenceDates.length;
+  const execution = taskProgressSteps(task);
+  const totalSteps = task.kind === "composite" ? task.occurrenceDates.length * task.subtasks.length : execution.total;
   const completedSteps =
     task.kind === "composite"
       ? task.occurrenceStates.reduce((sum, state) => sum + (state.completedSubtaskIds?.length ?? 0), 0)
-      : task.occurrenceStates.length;
+      : execution.completed;
   return totalSteps === 0 ? 0 : completedSteps / totalSteps;
 }
 
@@ -2923,23 +2934,14 @@ function taskProgressSteps(task: Task): { total: number; completed: number } {
   if (task.kind === "composite") {
     return { total: 0, completed: 0 };
   }
-  const completedDates = new Set(task.occurrenceStates.map((state) => state.date));
-  const total = task.occurrenceDates.filter((date) => {
-    if (completedDates.has(date)) {
-      return true;
-    }
-    if (task.consumeRequiresCompletion) {
-      return false;
-    }
-    return !isAttentionStatus(task.status);
-  }).length;
-  return {
-    total,
-    completed: task.occurrenceStates.length
-  };
+  const progress = getTaskExecutionProgress(task);
+  return { total: progress.total, completed: progress.completed };
 }
 
 function isTaskSeriesCompleted(task: Task): boolean {
+  if (task.kind === "simple" && task.consumeRequiresCompletion) {
+    return getTaskExecutionProgress(task).completedSeries;
+  }
   if (task.occurrenceDates.length === 0) {
     return false;
   }

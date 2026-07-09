@@ -67,6 +67,13 @@ import {
   normalizeTaskRecurrence,
   shouldConsumeOccurrence
 } from "../domain/taskRules";
+import {
+  appendOccurrenceDate,
+  getEffectiveOccurrenceDates,
+  getTaskExecutionProgress,
+  isCompletionGatedTask,
+  isOccurrenceDateAvailable
+} from "../domain/occurrenceSchedule";
 
 export const DEFAULT_CONFIG: PluginConfig = {
   version: "0.3.0",
@@ -237,13 +244,17 @@ export class ProjectManagementStore extends Events {
   }
 
   getAllTaskOccurrences(): TaskOccurrence[] {
+    const referenceDate = toDateKey(now());
     return this.getAllTasks()
-      .flatMap((task) => expandTask(task))
+      .flatMap((task) => expandTask(task, referenceDate))
       .sort(compareOccurrences);
   }
 
   getTasksForDate(date: string): TaskOccurrence[] {
-    return this.getAllTaskOccurrences().filter((task) => task.date === date);
+    return this.getAllTasks()
+      .flatMap((task) => expandTask(task, date))
+      .filter((task) => task.date === date)
+      .sort(compareOccurrences);
   }
 
   getTasksForProject(projectId: string): Task[] {
@@ -272,7 +283,7 @@ export class ProjectManagementStore extends Events {
 
   getOccurrencesForTask(taskId: string): TaskOccurrence[] {
     const task = this.findTask(taskId);
-    return task ? expandTask(task).sort(compareOccurrences) : [];
+    return task ? expandTask(task, toDateKey(now())).sort(compareOccurrences) : [];
   }
 
   getTask(taskId: string): Task | undefined {
@@ -456,10 +467,11 @@ export class ProjectManagementStore extends Events {
     if (!original) {
       throw new Error("任务不存在");
     }
-    if (!original.occurrenceDates.includes(date)) {
+    if (!isOccurrenceDateAvailable(original, date, date)) {
       throw new Error("任务发生日期不存在");
     }
     const next = cloneTask(original);
+    appendOccurrenceDate(next, date);
     next.occurrenceStates = completed
       ? upsertOccurrenceState(original, date, {
           completedSubtaskIds: getAllSubtaskIds(original),
@@ -525,24 +537,26 @@ export class ProjectManagementStore extends Events {
     if (!original) {
       throw new Error("任务不存在");
     }
-    if (!original.occurrenceDates.includes(date)) {
+    if (!isOccurrenceDateAvailable(original, date, date)) {
       throw new Error("任务发生日期不存在");
     }
-    if (original.occurrenceDates.length === 1) {
+    const source = cloneTask(original);
+    appendOccurrenceDate(source, date);
+    if (source.occurrenceDates.length === 1) {
       await this.updateTask(
         taskId,
         {
-          title: patch.title ?? original.title,
-          description: patch.description ?? original.description,
-          startTime: patch.startTime ?? original.startTime,
-          endTime: patch.endTime ?? original.endTime
+          title: patch.title ?? source.title,
+          description: patch.description ?? source.description,
+          startTime: patch.startTime ?? source.startTime,
+          endTime: patch.endTime ?? source.endTime
         },
         "series"
       );
       return;
     }
 
-    const occurrence = expandTask(original).find((item) => item.date === date);
+    const occurrence = expandTask(source, date).find((item) => item.date === date);
     if (!occurrence) {
       throw new Error("任务发生日期不存在");
     }
@@ -563,11 +577,11 @@ export class ProjectManagementStore extends Events {
       throw new Error("结束时间必须晚于开始时间");
     }
 
-    const next = cloneTask(original);
+    const next = cloneTask(source);
     next.occurrenceOverrides = replaceOccurrenceOverride(
       next,
       date,
-      buildOccurrenceDetailsOverride(original, date, {
+      buildOccurrenceDetailsOverride(source, date, {
         title,
         description,
         startTime: start || undefined,
@@ -1124,20 +1138,38 @@ export class ProjectManagementStore extends Events {
     if (!task) {
       return;
     }
-    if (!task.occurrenceDates.includes(date)) {
+    if (!isOccurrenceDateAvailable(task, date, date)) {
       throw new Error("任务发生日期不存在");
     }
-    if (task.occurrenceDates.length === 1) {
+    const source = cloneTask(task);
+    appendOccurrenceDate(source, date);
+    const executionProgress = getTaskExecutionProgress(source);
+    if (source.occurrenceDates.length === 1 || (isCompletionGatedTask(source) && executionProgress.total <= 1)) {
       const removed = this.replaceTasks([task.id], []);
       await this.persistMonths(monthsForTasks(removed));
       await this.reloadCurrentFolderData();
       this.trigger("changed");
       return;
     }
-    const next = cloneTask(task);
-    next.occurrenceDates = task.occurrenceDates.filter((entry) => entry !== date);
-    next.occurrenceStates = task.occurrenceStates.filter((entry) => entry.date !== date);
-    next.occurrenceOverrides = task.occurrenceOverrides.filter((entry) => entry.date !== date);
+    if (isCompletionGatedTask(source)) {
+      const next = cloneTask(source);
+      next.occurrenceDates = source.occurrenceDates.filter((entry) => entry !== date);
+      next.occurrenceStates = source.occurrenceStates.filter((entry) => entry.date !== date);
+      next.occurrenceOverrides = replaceOccurrenceOverride(next, date, { date, skipped: true, reason: "deleted" });
+      next.recurrenceCount = Math.max(1, executionProgress.total - 1);
+      next.updatedAt = toIsoLocal(now());
+      next.revision = (next.revision ?? 0) + 1;
+      this.assertCompositeTaskConsistency([next], new Set([task.id]));
+      this.replaceTasks([task.id], [next]);
+      await this.persistMonths(monthsForTasks([task, next]));
+      await this.reloadCurrentFolderData();
+      this.trigger("changed");
+      return;
+    }
+    const next = cloneTask(source);
+    next.occurrenceDates = source.occurrenceDates.filter((entry) => entry !== date);
+    next.occurrenceStates = source.occurrenceStates.filter((entry) => entry.date !== date);
+    next.occurrenceOverrides = source.occurrenceOverrides.filter((entry) => entry.date !== date);
     if (next.occurrenceDates.length > 0) {
       next.date = next.occurrenceDates[0];
       next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
@@ -1160,28 +1192,36 @@ export class ProjectManagementStore extends Events {
       return;
     }
     const effectiveDate = throughDate ?? task.occurrenceDates[task.occurrenceDates.length - 1];
-    if (!task.occurrenceDates.includes(effectiveDate)) {
+    if (!isOccurrenceDateAvailable(task, effectiveDate, effectiveDate)) {
       throw new Error("任务发生日期不存在");
     }
-    const next = cloneTask(task);
-    const remainingDates = task.occurrenceDates.filter((date) => compareDateKeys(date, effectiveDate) <= 0);
-    if (remainingDates.length === 0) {
+    const source = cloneTask(task);
+    appendOccurrenceDate(source, effectiveDate);
+    const next = cloneTask(source);
+    const effectiveDates = isCompletionGatedTask(source) ? getEffectiveOccurrenceDates(source, effectiveDate) : source.occurrenceDates;
+    const datesToComplete = effectiveDates.filter((date) => compareDateKeys(date, effectiveDate) <= 0);
+    if (datesToComplete.length === 0) {
       throw new Error("没有可保留的任务发生日期");
     }
     const stamp = toIsoLocal(now());
-    next.occurrenceDates = remainingDates;
-    next.occurrenceOverrides = task.occurrenceOverrides.filter((entry) => remainingDates.includes(entry.date));
-    next.occurrenceStates = remainingDates.reduce<TaskOccurrenceState[]>((records, date) => {
-      const existing = getOccurrenceState(task, date);
+    next.occurrenceDates = datesToComplete;
+    next.occurrenceOverrides = source.occurrenceOverrides.filter((entry) => datesToComplete.includes(entry.date));
+    next.occurrenceStates = datesToComplete.reduce<TaskOccurrenceState[]>((records, date) => {
+      const existing = getOccurrenceState(source, date);
       records.push(
-        buildNormalizedOccurrenceState(date, task.kind, task.subtasks, getAllSubtaskIds(task), existing?.completedAt ?? stamp)
+        buildNormalizedOccurrenceState(date, source.kind, source.subtasks, getAllSubtaskIds(source), existing?.completedAt ?? stamp)
       );
       return records;
     }, []);
     next.date = next.occurrenceDates[0];
-    next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
-    next.recurrenceCount = next.occurrenceDates.length;
-    next.recurrenceUntil = next.occurrenceDates.length > 1 ? next.occurrenceDates[next.occurrenceDates.length - 1] : null;
+    if (isCompletionGatedTask(next)) {
+      next.recurrenceCount = next.occurrenceDates.length;
+      next.recurrenceUntil = null;
+    } else {
+      next.recurrence = detectRecurrenceFromDates(next.occurrenceDates);
+      next.recurrenceCount = next.occurrenceDates.length;
+      next.recurrenceUntil = next.occurrenceDates.length > 1 ? next.occurrenceDates[next.occurrenceDates.length - 1] : null;
+    }
     next.updatedAt = stamp;
     next.revision = (next.revision ?? 0) + 1;
     this.assertCompositeTaskConsistency([next], new Set([task.id]));
@@ -1445,7 +1485,7 @@ export class ProjectManagementStore extends Events {
     const sameProject = this.getAllTasks().filter(
       (task) => normalizeImportIdentity(task.title) === normalizeImportIdentity(title) && (task.projectId ?? undefined) === projectId
     );
-    const sameDate = sameProject.find((task) => task.occurrenceDates.includes(date));
+    const sameDate = sameProject.find((task) => isOccurrenceDateAvailable(task, date, date));
     if (sameDate) {
       return sameDate;
     }
@@ -1457,7 +1497,7 @@ export class ProjectManagementStore extends Events {
       (task) =>
         normalizeImportIdentity(task.title) === normalizeImportIdentity(title) &&
         (task.projectId ?? undefined) === projectId &&
-        task.occurrenceDates.includes(date)
+        isOccurrenceDateAvailable(task, date, date)
     );
   }
 
@@ -2572,8 +2612,8 @@ function cloneTask(task: Task): Task {
   };
 }
 
-function expandTask(task: Task): TaskOccurrence[] {
-  return task.occurrenceDates.flatMap((date, index) => {
+function expandTask(task: Task, referenceDate = toDateKey(now())): TaskOccurrence[] {
+  return getEffectiveOccurrenceDates(task, referenceDate).flatMap((date, index) => {
     const override = getOccurrenceOverride(task, date);
     if (override?.skipped) {
       return [];
@@ -2839,7 +2879,7 @@ function buildOccurrenceKey(taskId: string, date: string): string {
 }
 
 function occurrenceKeysForTask(task: Task): Set<string> {
-  return new Set(task.occurrenceDates.map((date) => buildOccurrenceKey(task.id, date)));
+  return new Set(getEffectiveOccurrenceDates(task, toDateKey(now())).map((date) => buildOccurrenceKey(task.id, date)));
 }
 
 function assertMutableOccurrenceDate(date: string): void {
@@ -2849,6 +2889,9 @@ function assertMutableOccurrenceDate(date: string): void {
 }
 
 function isTaskFullyCompleted(task: Task): boolean {
+  if (isCompletionGatedTask(task)) {
+    return getTaskExecutionProgress(task).completedSeries;
+  }
   return task.occurrenceDates.length > 0 && task.occurrenceDates.every((date) => getOccurrenceProgress(task, date).completed);
 }
 

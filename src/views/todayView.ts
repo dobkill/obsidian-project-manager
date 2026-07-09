@@ -13,6 +13,7 @@ import {
   recurrenceLabel as formatRecurrenceLabel,
   statusLabel as formatStatusLabel
 } from "../domain/taskRules";
+import { getTaskExecutionProgress, occurrenceExecutionLabel } from "../domain/occurrenceSchedule";
 import {
   CompositeDisplayOccurrence,
   buildCompositeDisplayOccurrences,
@@ -188,6 +189,10 @@ export class TodayTasksView extends BaseProjectView {
       appendBadge(meta, task.startTime && task.endTime ? `${task.startTime}-${task.endTime}` : "未排期", "muted");
       appendBadge(meta, recurrenceLabel(task), "repeat");
       appendBadge(meta, statusLabel(task.status), `status-${task.status}`);
+      const executionLabel = occurrenceExecutionLabel(task);
+      if (executionLabel) {
+        appendBadge(meta, executionLabel, "repeat");
+      }
       appendBadge(meta, this.plugin.store.getProject(task.projectId)?.name ?? "未归属项目", "tag");
       if (task.kind === "composite") {
         appendBadge(meta, `${displayProgress.completedSteps}/${displayProgress.totalSteps} 子项`, "priority-medium");
@@ -422,6 +427,9 @@ function statusLabel(status: TaskOccurrence["status"]): string {
 }
 
 function isTaskSeriesCompleted(task: Task): boolean {
+  if (task.kind === "simple" && task.consumeRequiresCompletion) {
+    return getTaskExecutionProgress(task).completedSeries;
+  }
   if (task.occurrenceDates.length === 0) {
     return false;
   }
